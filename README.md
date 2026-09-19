@@ -1,4 +1,8 @@
-> 本地修改版：靓号模式现为全地址宽筛（默认 8-34 位），前后缀模式保留尾部快速路径。
+# 我的地址生成器
+
+独立维护的 TRON 靓号地址生成器，基于 [Daniel-Wu-1/tron_vanity_address_generation](https://github.com/Daniel-Wu-1/tron_vanity_address_generation) 修改，保留原作者的 MIT 许可证及版权声明。
+
+> 当前版本：靓号模式现为全地址宽筛（默认 8-34 位），前后缀模式保留尾部快速路径。
 > 操作、规则、输出格式和验证状态以 [全地址宽筛说明](docs/全地址宽筛说明.md) 为准；下方保留上游原版说明。
 > 当前开发机器无 NVIDIA CUDA 显卡，尚未完成真机性能验收。
 
@@ -7,7 +11,7 @@
   <a href="./README.en.md"><img alt="English" src="https://img.shields.io/badge/English-Switch-6e7781?style=flat-square"></a>
 </p>
 
-# TRON 靓号地址生成器 (CUDA + CPU 全速版)
+## 上游原版说明：TRON 靓号地址生成器 (CUDA + CPU 全速版)
 
 实测效率目前最高 ( RTX3060 一亿次/秒，6A的号秒级出 ) ，欢迎对比 ，代码结构已列出 ，完全免费 ，纯开源无加密 ( 包括CUDA运算单元，不像某些人发布的软件还带加密后台文件 ，这里就不点名道姓了 ) ，本软件代码和运行原理已公开 ，可自行审计/Fork/修改 ，也可以向作者申请授权 ，如果你有时间的话 ^^
 
