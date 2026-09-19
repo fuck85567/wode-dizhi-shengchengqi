@@ -5,12 +5,14 @@ These are scheduling/overflow tests, not GPU execution or throughput tests.
 import ctypes
 import json
 import signal
+import threading
+import time
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, mock_open
 
 import numpy as np
 import tron_vanity_gpu as app
@@ -59,7 +61,8 @@ def executor(max_workers, **_):
 
 
 class PipelineTests(unittest.TestCase):
-    def run_case(self, hits=True, interrupt=False, fail_worker=False):
+    def run_case(self, hits=True, interrupt=False, fail_worker=False,
+                 fail_save=False, capacity=3, rounds=1, on_launch=None, real_pool=False):
         points, steps = 24, 7
         states = [dict(cur_x=Array(np.array([0], dtype=np.uint64)),
                        cur_y=Array(np.array([0], dtype=np.uint64)),
@@ -83,34 +86,41 @@ class PipelineTests(unittest.TestCase):
             x.array[0] += count_steps
             y.array[0] += count_steps
             launches[0] += 1
-            if interrupt and launches[0] == 2:
+            if on_launch:
+                on_launch(launches[0])
+            if interrupt and launches[0] == 2*rounds:
                 signal.raise_signal(signal.SIGINT)
         with tempfile.TemporaryDirectory() as folder:
             output = str(Path(folder)/'matches.jsonl')
-            with patch.object(app, 'cp', fake_cp), patch.object(app, 'ProcessPoolExecutor', executor), \
+            pool_factory = app.ProcessPoolExecutor if real_pool else executor
+            with patch.object(app, 'cp', fake_cp), patch.object(app, 'ProcessPoolExecutor', pool_factory), \
                  patch.object(app, '_gpu_stats', return_value=None), patch.object(app, '_cpu_percent', return_value=None):
-                if fail_worker:
-                    with patch.object(app, 'classify_batch', side_effect=RuntimeError('injected worker failure')):
-                        with self.assertRaises(RuntimeError):
+                if fail_worker or fail_save:
+                    failure = (patch.object(app, 'classify_batch', side_effect=RuntimeError('injected worker failure'))
+                               if fail_worker else patch.object(app.os, 'fsync', side_effect=OSError('injected disk failure')))
+                    with failure:
+                        with self.assertRaises((RuntimeError, OSError)):
                             app.run_pipeline(kernel, None, dict(mode='exact', prefix='T'), output,
-                                             0.00000001, states, 1, 1, points, steps, 3)
+                                             0.00000001, states, 1, 1, points, steps, capacity)
                     recovered = [json.loads(line) for line in Path(output+'.pending.jsonl').read_text().splitlines()]
                     self.assertEqual(len(recovered), 2*points*steps)
                     self.assertEqual(len({r['address'] for r in recovered}), len(recovered))
                     return
                 metrics = app.run_pipeline(kernel, None, dict(mode='exact', prefix='T'), output,
                                            0 if interrupt else 0.00000001,
-                                           states, 1, 1, points, steps, 3)
+                                           states, 1, 1, points, steps, capacity)
             records = [json.loads(line) for line in Path(output).read_text(encoding='utf-8').splitlines()]
-            expected = points*steps*2
+            expected = points*steps*2*rounds
             self.assertEqual(metrics['addresses'], expected)
             self.assertEqual(metrics['candidates'], expected if hits else 0)
             self.assertEqual(metrics['classified'], expected if hits else 0)
             self.assertEqual(len(records), expected if hits else 0)
             self.assertEqual(len({x['address'] for x in records}), len(records))
             self.assertEqual(metrics['dropped_candidates'], 0)
-            if hits: self.assertGreater(metrics['overflow_replays'], 0)
-            self.assertEqual([s['step_offset'] for s in states], [steps, steps])
+            if hits and capacity < points*steps:
+                self.assertGreater(metrics['overflow_replays'], 0)
+            self.assertEqual([s['step_offset'] for s in states], [steps*rounds]*2)
+            return metrics
 
     def test_overflow_replay_and_timed_drain(self):
         self.run_case()
@@ -133,6 +143,95 @@ class PipelineTests(unittest.TestCase):
         self.run_case(interrupt=True)
     def test_worker_failure_retains_candidates(self):
         self.run_case(fail_worker=True)
+    def test_disk_failure_retains_candidates(self):
+        self.run_case(fail_save=True)
+
+    def test_real_spawn_pool_from_background_coordinator(self):
+        with patch.object(app, 'classifier_workers', return_value=2):
+            self.run_case(capacity=10000, real_pool=True)
+
+    def test_pool_submission_failure_retains_candidates(self):
+        class BrokenPool(ThreadPoolExecutor):
+            def submit(self, *args, **kwargs):
+                raise RuntimeError('injected submission failure')
+        with patch(__name__+'.executor', lambda max_workers, **_: BrokenPool(max_workers)):
+            self.run_case(fail_worker=True)
+
+    def test_ready_batch_saved_before_slow_first_batch(self):
+        release = threading.Event()
+        lock = threading.Lock()
+        calls = [0]
+        real_classify, real_sync = app.classify_batch, app.os.fsync
+        def slow_first(*args):
+            with lock:
+                calls[0] += 1
+                first = calls[0] == 1
+            if first and not release.wait(5):
+                raise RuntimeError('ready batch blocked behind first batch')
+            return real_classify(*args)
+        def sync_then_release(fd):
+            real_sync(fd)
+            release.set()
+        with patch.object(app, 'classify_batch', slow_first), \
+             patch.object(app.os, 'fsync', sync_then_release), \
+             patch.object(app, 'classifier_workers', return_value=2):
+            try:
+                self.run_case(capacity=10000)
+            finally:
+                release.set()
+
+    def test_gpu_launches_while_classifier_waits(self):
+        entered, release = threading.Event(), threading.Event()
+        real_classify = app.classify_batch
+        def delayed_classify(*args):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('GPU scheduling waited for classification')
+            return real_classify(*args)
+        def on_launch(count):
+            if count == 3:
+                self.assertTrue(entered.wait(5))
+            if count == 4:
+                release.set()
+        with patch.object(app, 'classify_batch', delayed_classify):
+            try:
+                self.run_case(interrupt=True, capacity=10000, rounds=2, on_launch=on_launch)
+            finally:
+                release.set()
+
+    def test_gpu_launches_while_disk_waits(self):
+        entered, release = threading.Event(), threading.Event()
+        def delayed_sync(_):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('GPU scheduling waited for disk')
+        def on_launch(count):
+            if count == 3:
+                self.assertTrue(entered.wait(5))
+            if count == 4:
+                release.set()
+        with patch.object(app.os, 'fsync', delayed_sync):
+            try:
+                self.run_case(interrupt=True, capacity=10000, rounds=2, on_launch=on_launch)
+            finally:
+                release.set()
+
+    def test_full_handoff_queue_drains_without_loss(self):
+        real_classify = app.classify_batch
+        def delayed_classify(*args):
+            time.sleep(0.02)
+            return real_classify(*args)
+        with patch.object(app, 'classifier_workers', return_value=1), \
+             patch.object(app, 'classify_batch', delayed_classify):
+            metrics = self.run_case()
+        self.assertGreater(metrics['backpressure_seconds'], 0)
+
+    def test_worker_count_respects_affinity_and_cpu_quota(self):
+        with patch.object(app.os, 'process_cpu_count', return_value=32, create=True), \
+             patch.object(app.os, 'sched_getaffinity', return_value=set(range(16)), create=True):
+            for quota, expected in [('max 100000', 14), ('800000 100000', 6), ('100000 100000', 1)]:
+                with patch('builtins.open', mock_open(read_data=quota)):
+                    self.assertEqual(app.classifier_workers(), expected)
 
 
 if __name__ == '__main__':

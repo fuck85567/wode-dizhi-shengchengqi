@@ -9,9 +9,10 @@ import atexit
 from datetime import datetime
 import json
 import math
+import queue
 from collections import deque
 from contextlib import contextmanager
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from cpu_worker import (classify_batch, gen_startpoints_batch, init_classifier,
                         validate_config, split_targets, rule_mask)
 if getattr(sys, "frozen", False):
@@ -415,6 +416,38 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
                         STEPS_PER_LAUNCH, MAX_MATCHES)
 
 
+def classifier_workers():
+    """Respect process affinity/container CPU quotas, reserving scheduling cores."""
+    available = getattr(os, "process_cpu_count", mp.cpu_count)() or 1
+    try:
+        available = min(available, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        if _HAS_PSUTIL:
+            try:
+                available = min(available, len(psutil.Process().cpu_affinity()))
+            except (AttributeError, psutil.Error):
+                pass
+    except OSError:
+        pass
+    # Common cgroup v2/v1 mounts used by Linux GPU containers.
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            available = min(available, max(1, math.ceil(int(quota)/int(period))))
+    except (OSError, ValueError):
+        try:
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+                quota = int(f.read())
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+                period = int(f.read())
+            if quota > 0:
+                available = min(available, max(1, math.ceil(quota/period)))
+        except (OSError, ValueError):
+            pass
+    return max(1, min(61 if sys.platform == "win32" else available, available-2))
+
+
 def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
                  n_blocks, block_size, points, launch_steps, capacity):
     """Double-stream generation with bounded asynchronous CPU classification.
@@ -446,9 +479,14 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
         state["backup_y"] = cp.empty_like(state["cur_y"])
         buffers.append(allocate(capacity))
     cp.cuda.Stream.null.synchronize()
-    workers = max(1, min(8, mp.cpu_count()-1))
-    pending, order = deque(), deque()
+    workers = classifier_workers()
+    pending, order = {}, deque()
+    candidate_queue = queue.Queue(maxsize=workers*4)
+    processor_stop = threading.Event()
+    processor_errors = []
+    submitting = []
     unsubmitted = []
+    unsubmitted_start = 0
     batches = iter(())
     metrics = {"addresses": 0, "candidates": 0, "classified": 0, "saved": 0,
                "overflow_replays": 0, "dropped_candidates": 0, "backpressure_seconds": 0.0}
@@ -533,9 +571,9 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
                 if value is not None:
                     hardware_totals[column] += value
                     hardware_counts[column] += 1
-            print("\rGPU {}/秒 | 候选 {}/秒 | 已分类 {} | 已保存 {} | 待处理 {}{}{}   ".format(
+            print("\rGPU {}/秒 | 候选 {}/秒 | 已分类 {} | 已保存 {} | 分类任务 {}批 | 缓冲 {}批{}{}   ".format(
                 fmt_num(metrics["addresses"]/elapsed), fmt_num(metrics["candidates"]/elapsed),
-                metrics["classified"], metrics["saved"], len(pending),
+                metrics["classified"], metrics["saved"], len(pending), candidate_queue.qsize(),
                 " | GPU {:.0f}%".format(gpu[0]) if gpu else "",
                 " | CPU {:.0f}%".format(cpu) if cpu is not None else ""), end="", flush=True)
             if metrics["candidates"]/elapsed > 10000:
@@ -553,60 +591,122 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
                            bytes(item["address"]).decode("ascii")))
         return result
 
-    # Disk-backed dedup avoids unbounded RAM growth in an unlimited search.
-    index = sqlite3.connect(output_path + ".index.sqlite3")
-    index.execute("CREATE TABLE IF NOT EXISTS addresses (address TEXT PRIMARY KEY)")
-    output = open(output_path, "a", encoding="utf-8")
     pool = ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"),
                                initializer=init_classifier)
     display = threading.Thread(target=status, daemon=True)
     display.start()
     error = None
 
-    def finish_one():
-        future, raw = pending[0]
-        records = future.result()  # propagate verification/worker errors
-        saved = 0
+    def process_candidates():
+        # One background coordinator owns classification futures and files.
+        # CUDA submission never waits for an individual future or an fsync.
+        index = output = None
         try:
-            for record in records:
-                if index.execute("INSERT OR IGNORE INTO addresses VALUES (?)", (record["address"],)).rowcount:
-                    output.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    saved += 1
-            if saved:
-                output.flush()
-                os.fsync(output.fileno())
-            index.commit()
-        except Exception:
-            index.rollback()
-            raise
-        metrics["saved"] += saved
-        metrics["classified"] += len(raw)
-        pending.popleft()
+            index = sqlite3.connect(output_path + ".index.sqlite3")
+            index.execute("CREATE TABLE IF NOT EXISTS addresses (address TEXT PRIMARY KEY)")
+            output = open(output_path, "a", encoding="utf-8")
+            while not processor_stop.is_set() or not candidate_queue.empty() or pending:
+                while len(pending) < workers*2:
+                    try:
+                        batch = candidate_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    # Retain ownership even if process-pool submission fails.
+                    submitting[:] = batch
+                    future = pool.submit(classify_batch, batch, config)
+                    pending[future] = batch
+                    submitting.clear()
+                ready = [future for future in pending if future.done()]
+                if ready:
+                    saved = classified = 0
+                    for future in ready:
+                        records = future.result()
+                        for record in records:
+                            if index.execute("INSERT OR IGNORE INTO addresses VALUES (?)", (record["address"],)).rowcount:
+                                output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                                saved += 1
+                        classified += len(pending[future])
+                    # Commit all currently ready batches together. Retain raw
+                    # candidates until both JSONL and dedup writes succeed.
+                    if saved:
+                        output.flush()
+                        os.fsync(output.fileno())
+                    index.commit()
+                    metrics["saved"] += saved
+                    metrics["classified"] += classified
+                    for future in ready:
+                        del pending[future]
+                elif pending:
+                    wait(pending, timeout=0.01, return_when=FIRST_COMPLETED)
+                else:
+                    # Wake promptly when the producer submits or stops.
+                    try:
+                        batch = candidate_queue.get(timeout=0.02)
+                    except queue.Empty:
+                        continue
+                    submitting[:] = batch
+                    future = pool.submit(classify_batch, batch, config)
+                    pending[future] = batch
+                    submitting.clear()
+        except Exception as exc:
+            processor_errors.append(exc)
+            if index is not None:
+                index.rollback()
+        finally:
+            try:
+                if output is not None:
+                    output.close()
+            except Exception as exc:
+                processor_errors.append(exc)
+            finally:
+                if index is not None:
+                    index.close()
+
+    processor = threading.Thread(target=process_candidates, name="candidate-processor")
+    processor.start()
+
+    def check_processor():
+        if processor_errors:
+            raise processor_errors[0]
 
     def enqueue(arr, idx, steps):
-        nonlocal unsubmitted
+        nonlocal unsubmitted, unsubmitted_start
         metrics["addresses"] += n_threads*points*steps
         metrics["candidates"] += len(arr)
         raw = candidates_from(arr, idx)
         unsubmitted = raw
-        # Bounded batches and queue: normal classification overlaps both GPU streams.
+        unsubmitted_start = 0
+        # A bounded handoff absorbs short CPU/disk stalls. Sustained overload
+        # still applies backpressure instead of discarding any candidates.
         for start in range(0, len(raw), 128):
-            while len(pending) >= workers*2:
-                if not pending[0][0].done():
-                    warn("CPU 分类队列已满，暂缓提交以保留全部候选。")
-                before = time.monotonic()
-                finish_one()
-                metrics["backpressure_seconds"] += time.monotonic()-before
             batch = raw[start:start+128]
-            pending.append((pool.submit(classify_batch, batch, config), batch))
-            unsubmitted = raw[start+128:]
+            while True:
+                check_processor()
+                try:
+                    candidate_queue.put_nowait(batch)
+                    break
+                except queue.Full:
+                    warn("CPU 处理缓冲已满，等待分类/写盘以保留全部候选。")
+                    before = time.monotonic()
+                    try:
+                        candidate_queue.put(batch, timeout=0.05)
+                        break
+                    except queue.Full:
+                        pass
+                    finally:
+                        metrics["backpressure_seconds"] += time.monotonic()-before
+            unsubmitted_start = start+len(batch)
+        unsubmitted = []
+        unsubmitted_start = 0
 
+    print("CPU 分类进程: {}；后台分类/保存，候选缓冲上限 {} 批。".format(workers, candidate_queue.maxsize))
     print("开始搜索；Ctrl+C 或到时后停止提交，排空在途候选再退出。")
     try:
         for idx in range(len(streams)):
             launch(idx, launch_steps)
             order.append(idx)
         while order:
+            check_processor()
             idx = order.popleft()
             # Normal case yields one batch. Replay batches are submitted as
             # they finish, bounding memory even under a dense filter.
@@ -616,36 +716,38 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
             if not interrupted.is_set() and time.monotonic() < deadline:
                 launch(idx, launch_steps)
                 order.append(idx)
-            while pending and pending[0][0].done():
-                finish_one()
-        while pending:
-            finish_one()
     except Exception as exc:
         error = exc
-        # Retain unclassified private-key/address pairs for recovery, never print keys.
-        recovery = output_path + ".pending.jsonl"
-        with open(recovery, "a", encoding="utf-8") as f:
-            for _, raw in pending:
-                for key, address in raw:
-                    f.write(json.dumps({"private_key": key, "address": address, "config": config})+"\n")
-            for key, address in unsubmitted:
-                f.write(json.dumps({"private_key": key, "address": address, "config": config})+"\n")
-            for arr, _ in batches:
-                for key, address in candidates_from(arr, idx):
-                    f.write(json.dumps({"private_key": key, "address": address, "config": config})+"\n")
-            for idx in order:
-                for arr, _ in collect(idx):
+    finally:
+        processor_stop.set()
+        processor.join()
+        if error is None and processor_errors:
+            error = processor_errors[0]
+    try:
+        if error is not None:
+            # Retain unclassified private-key/address pairs for recovery, never print keys.
+            recovery = output_path + ".pending.jsonl"
+            with open(recovery, "a", encoding="utf-8") as f:
+                raw_batches = list(pending.values()) + [submitting, unsubmitted[unsubmitted_start:]]
+                while not candidate_queue.empty():
+                    raw_batches.append(candidate_queue.get_nowait())
+                for raw in raw_batches:
+                    for key, address in raw:
+                        f.write(json.dumps({"private_key": key, "address": address, "config": config})+"\n")
+                for arr, _ in batches:
                     for key, address in candidates_from(arr, idx):
                         f.write(json.dumps({"private_key": key, "address": address, "config": config})+"\n")
-        print("\n处理失败，待验证候选已保存到 {}".format(recovery))
+                for idx in order:
+                    for arr, _ in collect(idx):
+                        for key, address in candidates_from(arr, idx):
+                            f.write(json.dumps({"private_key": key, "address": address, "config": config})+"\n")
+            print("\n处理失败，待验证候选已保存到 {}".format(recovery))
     finally:
         pool.shutdown(wait=True)
         display_stop.set()
         display.join()
         for stream in streams:
             stream.synchronize()
-        output.close()
-        index.close()
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
         elapsed = time.monotonic()-started
@@ -654,6 +756,7 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
         metrics.update(elapsed_seconds=elapsed, addresses_per_second=metrics["addresses"]/max(elapsed, .001),
                        candidates_per_second=metrics["candidates"]/max(elapsed, .001),
                        points_per_thread=points, initial_steps=initial_steps, final_steps=launch_steps,
+                       classifier_workers=workers, candidate_buffer_batches=candidate_queue.maxsize,
                        complete=error is None, config=config)
         with open(output_path + ".stats.json", "w", encoding="utf-8") as f:
             json.dump(metrics, f, ensure_ascii=False, indent=2)

@@ -131,47 +131,91 @@ def classify_vanity(address, config):
     mask = rule_mask(config)
     norm = address.lower()
     matches = []
-    # Prefix counts let random windows fail grouping in O(1), instead of
-    # constructing hundreds of run lists for every coarse candidate.
-    singletons = [0]
-    for i in range(34):
-        singletons.append(singletons[-1] + int(0 < i < 33 and norm[i] != norm[i-1] and norm[i] != norm[i+1]))
-    bad_up, bad_down = [0], [0]
-    for a, b in zip(norm, norm[1:]):
-        family = (a.isalpha() and b.isalpha()) or (a.isdigit() and b.isdigit())
-        delta = ord(b)-ord(a)
-        bad_up.append(bad_up[-1] + int(not family or delta not in (0, 1)))
-        bad_down.append(bad_down[-1] + int(not family or delta not in (0, -1)))
-    # Descending lengths permit containment suppression without losing locations.
-    for length in range(hi, lo-1, -1):
-        for start in range(35-length):
-            text = norm[start:start+length]
-            original = address[start:start+length]
-            same = text.count(text[0]) == length
-            if mask & 1 and original.count(original[0]) == length:
-                matches.append(_match(address, start, length, "连续相同字符", [[text[0], length]]))
-            if mask & 2 and same and text[0].isalpha():
+    # For a fixed start/type, every shorter hit is contained in its longest
+    # hit and would be removed by _summary. Scan boundaries instead of all
+    # 378 windows for the default 8..34 range; keep every independent start.
+    folded_end = list(range(1, 35))
+    raw_end = folded_end.copy()
+    for i in range(32, -1, -1):
+        if norm[i] == norm[i+1]:
+            folded_end[i] = folded_end[i+1]
+        if address[i] == address[i+1]:
+            raw_end[i] = raw_end[i+1]
+
+    if mask & 3:
+        for start in range(35-lo):
+            length = min(hi, raw_end[start]-start)
+            if mask & 1 and length >= lo:
+                matches.append(_match(address, start, length, "连续相同字符", [[norm[start], length]]))
+            length = min(hi, folded_end[start]-start)
+            if mask & 2 and length >= lo and norm[start].isalpha():
+                original = address[start:start+length]
                 tags = ["混合大小写"] if original != original.upper() and original != original.lower() else []
-                matches.append(_match(address, start, length, "同字母忽略大小写", [[text[0], length]], tags))
-            if mask & 4 and not same:
-                end = start+length
-                paired = (text[0] == text[1] and text[-1] == text[-2] and
-                          singletons[end-1] == singletons[start+1])
-                direction = (1 if bad_up[end-1] == bad_up[start] else
-                             -1 if bad_down[end-1] == bad_down[start] else 0)
-                if paired or direction:
-                    groups = _run_groups(text)
-                    tags = ["分组递增" if direction > 0 else "分组递减"] if direction else []
-                    matches.append(_match(address, start, length, "连续分组", groups, tags))
-            if mask & 8 and length <= 9 and (text in "123456789" or text in "987654321"):
-                matches.append(_match(address, start, length, "数字顺子"))
-            if mask & 16 and not same:
-                for period in range(2, min(4, length//2)+1):
-                    if text[period:] == text[:-period]:
-                        matches.append(_match(address, start, length, "周期重复", tags=["周期{}位".format(period)]))
-                        break
-            if mask & 32 and text == text[::-1]:
-                matches.append(_match(address, start, length, "回文"))
+                matches.append(_match(address, start, length, "同字母忽略大小写", [[norm[start], length]], tags))
+
+    if mask & 4:
+        up, down = list(range(1, 35)), list(range(1, 35))
+        for i in range(32, -1, -1):
+            a, b = norm[i], norm[i+1]
+            family = (a.isalpha() and b.isalpha()) or (a.isdigit() and b.isdigit())
+            delta = ord(b)-ord(a)
+            if family and delta in (0, 1):
+                up[i] = up[i+1]
+            if family and delta in (0, -1):
+                down[i] = down[i+1]
+        # End of each uninterrupted sequence of runs of length >= 2.
+        paired_end = [0]*35
+        for i in range(32, -1, -1):
+            end = folded_end[i]
+            if end-i >= 2:
+                paired_end[i] = max(end, paired_end[end])
+        for start in range(35-lo):
+            paired = min(start+hi, paired_end[start])
+            # The upper length bound must not leave a singleton final group.
+            if paired > start+1 and norm[paired-1] != norm[paired-2]:
+                paired -= 1
+            end = max(paired, min(start+hi, max(up[start], down[start])))
+            if end-start >= lo and end > folded_end[start]:
+                direction = 1 if end <= up[start] else -1 if end <= down[start] else 0
+                tags = ["分组递增" if direction > 0 else "分组递减"] if direction else []
+                matches.append(_match(address, start, end-start, "连续分组",
+                                      _run_groups(norm[start:end]), tags))
+
+    if mask & 8 and lo <= 9:
+        for start in range(35-lo):
+            if norm[start] not in "123456789":
+                continue
+            for delta in (1, -1):
+                end = start+1
+                while end < min(34, start+hi, start+9) and norm[end] in "123456789" and ord(norm[end])-ord(norm[end-1]) == delta:
+                    end += 1
+                if end-start >= lo:
+                    matches.append(_match(address, start, end-start, "数字顺子"))
+
+    if mask & 16:
+        best = [0]*34
+        periods = [0]*34
+        for period in (2, 3, 4):
+            repeated = 0
+            for start in range(33-period, -1, -1):
+                repeated = repeated+1 if norm[start] == norm[start+period] else 0
+                length = min(hi, repeated+period)
+                if length >= max(lo, 2*period) and start+length > folded_end[start] and length > best[start]:
+                    best[start], periods[start] = length, period
+        for start, length in enumerate(best):
+            if length:
+                matches.append(_match(address, start, length, "周期重复", tags=["周期{}位".format(periods[start])]))
+
+    if mask & 32:
+        # Each center contributes only its longest allowed palindrome.
+        for center in range(67):
+            left, right = center//2, (center+1)//2
+            while left >= 0 and right < 34 and right-left+1 <= hi and norm[left] == norm[right]:
+                left -= 1
+                right += 1
+            length = right-left-1
+            if length >= lo:
+                matches.append(_match(address, left+1, length, "回文"))
     return _summary(matches)
 
 

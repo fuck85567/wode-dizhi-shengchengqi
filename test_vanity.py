@@ -30,6 +30,23 @@ def fixtures():
 
 
 class ClassifierTests(unittest.TestCase):
+    def test_optimized_classifier_matches_reference(self):
+        from classifier_reference import classify_reference
+        rng = random.Random(20260920)
+        addresses = list(fixtures())
+        addresses += ['T'+'a'*33, 'T'+'AaB'*11, 'T'+('aabbCCdd'*5)[:33],
+                      'T'+('123454321'*4)[:33], 'T'+('ABCD'*9)[:33]]
+        addresses += ['T'+''.join(rng.choices('aAbBcC123', k=33)) for _ in range(150)]
+        for address in addresses:
+            configs = [dict(mode='wide'), dict(mode='wide', min_len=8, max_len=8)]
+            for _ in range(5):
+                lo = rng.randint(2, 34)
+                configs.append(dict(mode='wide', min_len=lo, max_len=rng.randint(lo, 34),
+                                    rules={key: bool(rng.getrandbits(1)) for key in RULE_BITS}))
+            for cfg in configs:
+                with self.subTest(address=address, config=cfg):
+                    self.assertEqual(classify_vanity(address, cfg), classify_reference(address, cfg))
+
     def test_all_user_examples_all_positions(self):
         for fragment in EXAMPLES:
             for start in range(1, 35-len(fragment)):
