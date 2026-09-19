@@ -3,6 +3,7 @@
 独立维护的 TRON 靓号地址生成器，基于 [Daniel-Wu-1/tron_vanity_address_generation](https://github.com/Daniel-Wu-1/tron_vanity_address_generation) 修改，保留原作者的 MIT 许可证及版权声明。
 
 > 当前版本：靓号模式现为全地址宽筛（默认 8-34 位），前后缀模式保留尾部快速路径。
+> 正常启动默认 M=24，取消 M 比较测速和批次预热；保留正确性自检，编译失败才回退 M=16/8。
 > 操作、规则、输出格式和验证状态以 [全地址宽筛说明](docs/全地址宽筛说明.md) 为准；下方保留上游原版说明。
 > 当前开发机器无 NVIDIA CUDA 显卡，尚未完成真机性能验收。
 

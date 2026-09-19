@@ -9,7 +9,6 @@ import atexit
 from datetime import datetime
 import json
 import math
-import statistics
 from collections import deque
 from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor
@@ -245,8 +244,7 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
             "✗ GPU 计算能力 {}.{} 太低 (需要 ≥ 7.0, 即 RTX 20 系或更新).\n"
             "  当前 GPU: {}\n".format(cc_major, cc_minor, gpu_name))
         sys.exit(1)
-    M_CANDIDATES = [8, 16, 24, 32]
-    POINTS_PER_THREAD = None
+    POINTS_PER_THREAD = 24
     THREADS_PER_BLOCK = 64
     BLOCKS_PER_SM = 4
     n_blocks = n_sms * BLOCKS_PER_SM
@@ -279,78 +277,22 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
     print("=" * 70)
     print()
     print()
-    print("按当前模式实测 M (8 / 16 / 24 / 32)...")
     arch = "sm_{}{}".format(cc_major, cc_minor)
-    # Reuse immutable host startpoints across M trials; GPU arrays are separate.
-    # This generates max(M)*n_threads random points, rather than sum(M)*n_threads.
-    bench_x, bench_y = bytearray(), bytearray()
-    def _bench_m(m_val):
+    print("默认 M=24，跳过启动测速。", flush=True)
+    kernel = None
+    # Fall back only on compilation failure; do not run speed comparisons.
+    for m_value in (POINTS_PER_THREAD, 16, 8):
         try:
-            with startup_stage("M={} 编译/加载 CUDA 内核（首次可能较慢）".format(m_val)):
-                k = load_kernel(arch=arch, points_per_thread=m_val, mode=mode)
-            # Use the production grid and independent random starts. A small,
-            # identical-point microbenchmark biases both occupancy and hits.
-            required = n_threads*m_val
-            prepared = len(bench_x)//32
-            print("  M={} 准备测速起点：{}/{}".format(m_val, prepared, required), flush=True)
-            last_report = time.monotonic()
-            while prepared < required:
-                chunk = min(16384, required-prepared)
-                xb, yb, _ = gen_startpoints_batch(chunk)
-                bench_x.extend(xb)
-                bench_y.extend(yb)
-                prepared += chunk
-                if prepared == required or time.monotonic()-last_report >= 2:
-                    print("  M={} 测速起点：{}/{} ({:.0f}%)".format(
-                        m_val, prepared, required, 100*prepared/required), flush=True)
-                    last_report = time.monotonic()
-            sx = np.frombuffer(bench_x, dtype=">u8", count=required*4).reshape(-1, 4)[:, ::-1].astype(np.uint64).ravel()
-            sy = np.frombuffer(bench_y, dtype=">u8", count=required*4).reshape(-1, 4)[:, ::-1].astype(np.uint64).ravel()
-            cur_x, cur_y = cp.asarray(sx), cp.asarray(sy)
-            params = cp.asarray(make_pattern_params(config))
-            hits, count = cp.zeros(16384, dtype=MATCH_DTYPE), cp.zeros(1, dtype=cp.uint32)
-            samples = []
-            for trial in range(4):
-                count.fill(0)
-                cp.cuda.Stream.null.synchronize()
-                begin, end = cp.cuda.Event(), cp.cuda.Event()
-                label = "M={} {}".format(m_val, "GPU 预热" if trial == 0 else "GPU 测速 {}/3".format(trial))
-                with startup_stage(label):
-                    begin.record()
-                    k((n_blocks,), (THREADS_PER_BLOCK,),
-                      (cur_x, cur_y, np.int32(16), np.uint64(trial*16),
-                       params, hits, count, np.uint32(len(hits))))
-                    end.record()
-                    end.synchronize()
-                if trial:
-                    samples.append(n_threads*m_val*16 / (cp.cuda.get_elapsed_time(begin, end)/1000))
-            return (statistics.median(samples), k), None
+            with startup_stage("M={} 编译/加载 CUDA 内核（首次可能较慢）".format(m_value)):
+                kernel = load_kernel(arch=arch, points_per_thread=m_value, mode=mode)
+            POINTS_PER_THREAD = m_value
+            break
         except Exception as exc:
-            return None, "编译或运行失败: {}".format(exc)
-    best_rate, best_M, best_kernel = 0.0, None, None
-    for M_try in M_CANDIDATES:
-        result, err = _bench_m(M_try)
-        if err:
-            print("  M={}: {}".format(M_try, err), flush=True)
-            continue
-        rate, k_obj = result
-        print("  M={}: {:.1f}M/秒".format(M_try, rate / 1e6), flush=True)
-        if rate > best_rate:
-            best_rate, best_M, best_kernel = rate, M_try, k_obj
-    del bench_x, bench_y
-    if best_kernel is None:
-        sys.stderr.write(
-            "\n✗ CUDA 内核所有 M 值都编译失败, GPU 不兼容.\n"
-            "  可能原因:\n"
-            "    1) NVRTC 找不到 CUDA 头文件 (重装 nvidia-cuda-nvrtc-cu12 和 nvidia-cuda-runtime-cu12)\n"
-            "    2) GPU 驱动版本太老, 升级 NVIDIA 驱动到 535+\n"
-            "    3) GPU 计算能力 < 7.0 (RTX 20 系以下不支持)\n")
+            print("  M={} 编译失败: {}".format(m_value, exc), flush=True)
+    if kernel is None:
+        sys.stderr.write("✗ CUDA 内核编译失败，请检查 NVIDIA 驱动和 CUDA 依赖。\n")
         sys.exit(1)
-    POINTS_PER_THREAD = best_M
-    kernel = best_kernel
-    BATCH = n_threads * STEPS_PER_LAUNCH * POINTS_PER_THREAD
-    print("→ 选用 M={} (摊销 {:.0f} mul/点, 当前模式实测最快)".format(
-        POINTS_PER_THREAD, 256 / POINTS_PER_THREAD + 3))
+    print("→ 使用 M={}，初始每批 {} 步".format(POINTS_PER_THREAD, STEPS_PER_LAUNCH), flush=True)
     print()
     print("GPU 自检: 单线程执行 1 步 (M={}个点)...".format(POINTS_PER_THREAD))
     self_t0 = time.time()
@@ -468,41 +410,6 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
     print("起点准备完成, 用时 {:.1f}s ({:.0f} pts/s)".format(
         time.time() - t1, total_pts / max(time.time() - t1, 0.001)))
     print()
-    print("自适应调参: 测量单步耗时...")
-    pp_warmup_dev = cp.asarray(pp)
-    m_warmup = cp.zeros(MAX_MATCHES, dtype=MATCH_DTYPE)
-    c_warmup = cp.zeros(1, dtype=cp.uint32)
-    warmup_state = {"cur_x": stream_state[0]["cur_x"].copy(),
-                    "cur_y": stream_state[0]["cur_y"].copy()}
-    cp.cuda.Stream.null.synchronize()
-    t_warm = time.time()
-    WARMUP_STEPS = 64
-    kernel(
-        (n_blocks,), (THREADS_PER_BLOCK,),
-        (warmup_state["cur_x"], warmup_state["cur_y"],
-         np.int32(WARMUP_STEPS), np.uint64(0),
-         pp_warmup_dev, m_warmup, c_warmup, np.uint32(MAX_MATCHES))
-    )
-    cp.cuda.Stream.null.synchronize()
-    elapsed_warm = time.time() - t_warm
-    warmup_hits = int(c_warmup.get()[0])
-    target_sec = 1.5
-    per_step = elapsed_warm / WARMUP_STEPS
-    STEPS_PER_LAUNCH = max(1, int(target_sec / max(per_step, 1e-6)))
-    STEPS_PER_LAUNCH = max(1, min(STEPS_PER_LAUNCH, 2048))
-    if warmup_hits > 0:
-        # Keep the GPU->CPU candidate batch bounded.  The wide screen is
-        # intentionally recall-first, so shorten launches rather than drop
-        # candidates when a GPU produces a dense structural region.
-        estimated_steps = int((MAX_MATCHES * 0.5) / max(warmup_hits / float(WARMUP_STEPS), 1e-9))
-        STEPS_PER_LAUNCH = max(1, min(STEPS_PER_LAUNCH, estimated_steps))
-    BATCH = n_threads * STEPS_PER_LAUNCH * POINTS_PER_THREAD
-    print("  warmup: {} 步用 {:.2f}s ({:.2f}ms/步)".format(WARMUP_STEPS, elapsed_warm, per_step * 1000))
-    if warmup_hits > MAX_MATCHES:
-        print("  警告: 当前条件命中率过高, warmup 已超过 GPU 命中缓冲上限 {}".format(MAX_MATCHES))
-    print("  自适应 STEPS_PER_LAUNCH = {} (预期 ~{:.1f}s/launch, ~{:.1f}M 地址/launch)".format(
-        STEPS_PER_LAUNCH, STEPS_PER_LAUNCH * per_step, BATCH / 1e6))
-    print()
     return run_pipeline(kernel, pp_dev, config, output_path, duration_minutes,
                         stream_state, n_blocks, THREADS_PER_BLOCK, POINTS_PER_THREAD,
                         STEPS_PER_LAUNCH, MAX_MATCHES)
@@ -525,13 +432,14 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
     buffers = []
 
     def allocate(size):
+        # Pool allocations may be rounded up; views must use the requested count.
         pinned = cp.cuda.alloc_pinned_memory(MATCH_DTYPE.itemsize * size)
         count_host = cp.cuda.alloc_pinned_memory(4)
         return {"device": cp.empty(size, dtype=MATCH_DTYPE),
                 "count": cp.zeros(1, dtype=cp.uint32), "pinned": pinned,
-                "host": np.frombuffer(pinned, dtype=MATCH_DTYPE),
+                "host": np.frombuffer(pinned, dtype=MATCH_DTYPE, count=size),
                 "count_host": count_host,
-                "count_view": np.frombuffer(count_host, dtype=np.uint32), "capacity": size}
+                "count_view": np.frombuffer(count_host, dtype=np.uint32, count=1), "capacity": size}
 
     for state in states:
         state["backup_x"] = cp.empty_like(state["cur_x"])

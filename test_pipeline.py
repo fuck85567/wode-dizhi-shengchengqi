@@ -114,6 +114,19 @@ class PipelineTests(unittest.TestCase):
 
     def test_overflow_replay_and_timed_drain(self):
         self.run_case()
+    def test_rounded_pinned_buffers_and_overflow_reallocation(self):
+        allocations = []
+        def rounded_pinned(size):
+            # CUDA's memory pool can expose more bytes than requested, even
+            # for the 4-byte counter. Record buffers need not divide evenly.
+            allocated = ((size + 511) // 512) * 512
+            allocations.append((size, allocated))
+            return pinned(allocated)
+        with patch.object(fake_cp.cuda, 'alloc_pinned_memory', rounded_pinned):
+            self.run_case()
+        self.assertIn((4, 512), allocations)
+        self.assertTrue(any(size > 3*app.MATCH_DTYPE.itemsize
+                            for size, _ in allocations))
     def test_no_hits_still_exits(self):
         self.run_case(hits=False)
     def test_ctrl_c_drains_both_streams(self):
