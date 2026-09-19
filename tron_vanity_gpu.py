@@ -11,6 +11,7 @@ import json
 import math
 import statistics
 from collections import deque
+from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor
 from cpu_worker import (classify_batch, gen_startpoints_batch, init_classifier,
                         validate_config, split_targets, rule_mask)
@@ -188,6 +189,27 @@ def make_pattern_params(cfg):
         pp_local["suffixes"][0, i, :len(value)] = np.frombuffer(value.encode(), dtype=np.uint8)
     return pp_local
 
+
+@contextmanager
+def startup_stage(label):
+    """Show long compilation/setup stages even before any GPU rate exists."""
+    started = time.monotonic()
+    finished = threading.Event()
+    print("  {}...".format(label), flush=True)
+
+    def report():
+        while not finished.wait(5):
+            print("  {}，已等待 {:.0f} 秒...".format(label, time.monotonic()-started), flush=True)
+
+    reporter = threading.Thread(target=report, daemon=True)
+    reporter.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        reporter.join()
+
+
 def run_search(config: dict, output_path: str, duration_minutes: float = 0):
     validate_config(config)
     if not math.isfinite(duration_minutes) or duration_minutes < 0:
@@ -223,7 +245,7 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
             "✗ GPU 计算能力 {}.{} 太低 (需要 ≥ 7.0, 即 RTX 20 系或更新).\n"
             "  当前 GPU: {}\n".format(cc_major, cc_minor, gpu_name))
         sys.exit(1)
-    M_CANDIDATES = [32, 24, 16, 8]
+    M_CANDIDATES = [8, 16, 24, 32]
     POINTS_PER_THREAD = None
     THREADS_PER_BLOCK = 64
     BLOCKS_PER_SM = 4
@@ -259,14 +281,31 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
     print()
     print("按当前模式实测 M (8 / 16 / 24 / 32)...")
     arch = "sm_{}{}".format(cc_major, cc_minor)
+    # Reuse immutable host startpoints across M trials; GPU arrays are separate.
+    # This generates max(M)*n_threads random points, rather than sum(M)*n_threads.
+    bench_x, bench_y = bytearray(), bytearray()
     def _bench_m(m_val):
         try:
-            k = load_kernel(arch=arch, points_per_thread=m_val, mode=mode)
+            with startup_stage("M={} 编译/加载 CUDA 内核（首次可能较慢）".format(m_val)):
+                k = load_kernel(arch=arch, points_per_thread=m_val, mode=mode)
             # Use the production grid and independent random starts. A small,
             # identical-point microbenchmark biases both occupancy and hits.
-            xb, yb, _ = gen_startpoints_batch(n_threads*m_val)
-            sx = np.frombuffer(xb, dtype=">u8").reshape(-1, 4)[:, ::-1].astype(np.uint64).ravel()
-            sy = np.frombuffer(yb, dtype=">u8").reshape(-1, 4)[:, ::-1].astype(np.uint64).ravel()
+            required = n_threads*m_val
+            prepared = len(bench_x)//32
+            print("  M={} 准备测速起点：{}/{}".format(m_val, prepared, required), flush=True)
+            last_report = time.monotonic()
+            while prepared < required:
+                chunk = min(16384, required-prepared)
+                xb, yb, _ = gen_startpoints_batch(chunk)
+                bench_x.extend(xb)
+                bench_y.extend(yb)
+                prepared += chunk
+                if prepared == required or time.monotonic()-last_report >= 2:
+                    print("  M={} 测速起点：{}/{} ({:.0f}%)".format(
+                        m_val, prepared, required, 100*prepared/required), flush=True)
+                    last_report = time.monotonic()
+            sx = np.frombuffer(bench_x, dtype=">u8", count=required*4).reshape(-1, 4)[:, ::-1].astype(np.uint64).ravel()
+            sy = np.frombuffer(bench_y, dtype=">u8", count=required*4).reshape(-1, 4)[:, ::-1].astype(np.uint64).ravel()
             cur_x, cur_y = cp.asarray(sx), cp.asarray(sy)
             params = cp.asarray(make_pattern_params(config))
             hits, count = cp.zeros(16384, dtype=MATCH_DTYPE), cp.zeros(1, dtype=cp.uint32)
@@ -275,12 +314,14 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
                 count.fill(0)
                 cp.cuda.Stream.null.synchronize()
                 begin, end = cp.cuda.Event(), cp.cuda.Event()
-                begin.record()
-                k((n_blocks,), (THREADS_PER_BLOCK,),
-                  (cur_x, cur_y, np.int32(16), np.uint64(trial*16),
-                   params, hits, count, np.uint32(len(hits))))
-                end.record()
-                end.synchronize()
+                label = "M={} {}".format(m_val, "GPU 预热" if trial == 0 else "GPU 测速 {}/3".format(trial))
+                with startup_stage(label):
+                    begin.record()
+                    k((n_blocks,), (THREADS_PER_BLOCK,),
+                      (cur_x, cur_y, np.int32(16), np.uint64(trial*16),
+                       params, hits, count, np.uint32(len(hits))))
+                    end.record()
+                    end.synchronize()
                 if trial:
                     samples.append(n_threads*m_val*16 / (cp.cuda.get_elapsed_time(begin, end)/1000))
             return (statistics.median(samples), k), None
@@ -290,12 +331,13 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
     for M_try in M_CANDIDATES:
         result, err = _bench_m(M_try)
         if err:
-            print("  M={}: {}".format(M_try, err))
+            print("  M={}: {}".format(M_try, err), flush=True)
             continue
         rate, k_obj = result
-        print("  M={}: {:.1f}M/秒".format(M_try, rate / 1e6))
+        print("  M={}: {:.1f}M/秒".format(M_try, rate / 1e6), flush=True)
         if rate > best_rate:
             best_rate, best_M, best_kernel = rate, M_try, k_obj
+    del bench_x, bench_y
     if best_kernel is None:
         sys.stderr.write(
             "\n✗ CUDA 内核所有 M 值都编译失败, GPU 不兼容.\n"
@@ -333,7 +375,8 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
         pp_test_dev = cp.asarray(pp_test)
         m_test = cp.zeros(POINTS_PER_THREAD * 2, dtype=MATCH_DTYPE)
         c_test = cp.zeros(1, dtype=cp.uint32)
-        check_kernel = load_kernel(arch=arch, points_per_thread=POINTS_PER_THREAD)
+        with startup_stage("编译/加载 GPU 自检内核"):
+            check_kernel = load_kernel(arch=arch, points_per_thread=POINTS_PER_THREAD)
         check_kernel(
             (1,), (1,),
             (cur_x_test, cur_y_test, np.int32(1), np.uint64(0),
@@ -376,7 +419,16 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
     ctx_pool = mp.get_context("spawn")
     try:
         with ctx_pool.Pool(processes=cpu_count) as pool:
-            results = pool.map(gen_startpoints_batch, tasks)
+            results = []
+            prepared = 0
+            last_report = time.monotonic()
+            for result in pool.imap(gen_startpoints_batch, tasks):
+                results.append(result)
+                prepared += len(result[2])
+                if prepared == total_pts or time.monotonic()-last_report >= 2:
+                    print("  正式搜索起点：{}/{} ({:.0f}%)".format(
+                        prepared, total_pts, 100*prepared/total_pts), flush=True)
+                    last_report = time.monotonic()
     except Exception as e:
         sys.stderr.write(
             "✗ 起点生成失败: {}\n"
