@@ -7,3 +7,5 @@ __pycache__/
 
 .venv/
 /benchmark_results.json
+/精选结果/
+/dist/
