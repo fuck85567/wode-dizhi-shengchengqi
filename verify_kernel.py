@@ -10,7 +10,7 @@ import coincurve
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tron_vanity_gpu import (
     PATTERN_DTYPE, MATCH_DTYPE, load_kernel,
-    cpu_priv_to_address, SECP256K1_N
+    cpu_priv_to_address, SECP256K1_N, make_pattern_params, KERNEL_PATH
 )
 def verify_with_m(M):
     props = cp.cuda.runtime.getDeviceProperties(0)
@@ -40,10 +40,10 @@ def verify_with_m(M):
     start_x = cp.asarray(sx)
     start_y = cp.asarray(sy)
     pp = np.zeros(1, dtype=PATTERN_DTYPE)
-    pp["prefix_len"] = 1
-    pp["suffix_len"] = 0
-    pp["repeat_n"] = 0
-    pp["prefix"][0, 0] = ord("T")
+    pp["mode"] = 0
+    pp["prefix_count"] = 1
+    pp["prefix_len"][0, 0] = 1
+    pp["prefixes"][0, 0, 0] = ord("T")
     pp_dev = cp.asarray(pp)
     MAX_MATCHES = THREADS * STEPS * M * 4 + 10
     matches_dev = cp.zeros(MAX_MATCHES, dtype=MATCH_DTYPE)
@@ -64,14 +64,14 @@ def verify_with_m(M):
     expected = THREADS * STEPS * M * 2
     print("内核报告命中: {} (期望 {})".format(n_hits, expected))
     if n_hits != expected:
-        print("⚠ 命中数不匹配")
+        raise AssertionError("命中数不匹配")
     n_check = min(n_hits, MAX_MATCHES)
     matches = matches_dev[:n_check].get()
     mismatches = 0
+    assert len({(int(m["thread_id"]), int(m["step"])) for m in matches}) == expected
     for m in matches:
         packed = int(m["thread_id"])
-        real_tid = packed >> 4
-        p_idx = packed & 0xF
+        real_tid, p_idx = divmod(packed, M)
         step = int(m["step"])
         gpu_addr = bytes(m["address"]).decode("ascii", errors="replace")
         if real_tid >= THREADS or p_idx >= M:
@@ -89,11 +89,158 @@ def verify_with_m(M):
                 print("    CPU: {}".format(cpu_addr))
     if mismatches == 0:
         print("✓ M={}: 全部 {} 个 GPU 地址 (2 次启动, 状态延续) 与 CPU 完全一致".format(M, n_check))
+        verify_filtered_search(M, THREADS, STEPS*2, sx, sy, matches)
         return True
     else:
         print("✗ M={}: 发现 {} 个不匹配".format(M, mismatches))
         return False
+def verify_filtered_search(m, threads, steps, sx, sy, all_matches):
+    from cpu_worker import classify_vanity
+    known = {(int(r["thread_id"]), int(r["step"])): bytes(r["address"]).decode("ascii")
+             for r in all_matches}
+    targets = list(known.values())
+    first, last = targets[0], targets[-1]
+    cases = [dict(mode="exact", suffix=first[-6:]+","+last[-5:]),
+             dict(mode="exact", prefix=first[:5]+","+last[:6]),
+             dict(mode="exact", prefix=first[:5], suffix=first[-6:]),
+             dict(mode="exact", prefix=first[:5], suffix=last[-6:], combine_or=True),
+             dict(mode="exact", suffix=first[-6:], combine_or=True),
+             dict(mode="exact", prefix=first[:5], combine_or=True),
+             dict(mode="wide", min_len=2, max_len=8)]
+    kernels = {mode: load_kernel(points_per_thread=m, mode=mode) for mode in ("exact", "wide")}
+    for cfg in cases:
+        x, y = cp.asarray(sx), cp.asarray(sy)
+        params = cp.asarray(make_pattern_params(cfg))
+        out = cp.empty(len(known), dtype=MATCH_DTYPE)
+        count = cp.zeros(1, dtype=cp.uint32)
+        kernels[cfg["mode"]]((1,), (threads,),
+                            (x, y, np.int32(steps), np.uint64(0), params, out, count, np.uint32(len(out))))
+        n = int(count.get()[0])
+        assert n <= len(out)
+        actual = {}
+        for r in out[:n].get():
+            key = (int(r["thread_id"]), int(r["step"]))
+            address = bytes(r["address"]).decode("ascii")
+            assert known[key] == address
+            assert key not in actual
+            actual[key] = address
+        expected = {key for key, address in known.items() if classify_vanity(address, cfg)}
+        assert expected <= actual.keys(), (m, cfg, "missed candidates")
+        if cfg["mode"] == "exact":
+            assert expected == actual.keys(), (m, cfg, "false exact matches")
+    print("✓ M={} 单独编译的前后缀/全地址路径与 CPU 结果一致".format(m))
+def verify_screen():
+    from test_vanity import fixtures
+    from cpu_worker import classify_vanity, RULE_BITS
+    addresses = list(fixtures())
+    module = cp.RawModule(code=open(KERNEL_PATH, encoding="utf-8").read(),
+                          options=("-std=c++14", "-DPOINTS_PER_THREAD=8"))
+    kernel = module.get_function("screen_addresses")
+    encoded = cp.asarray(np.frombuffer("".join(addresses).encode(), dtype=np.uint8))
+    output = cp.zeros(len(addresses), dtype=cp.uint8)
+    comparisons = 0
+    for lo, hi in ((2, 5), (5, 8), (8, 8), (8, 12), (8, 34), (9, 34), (12, 34), (34, 34)):
+        for only in [None]+list(RULE_BITS):
+            cfg = dict(mode="wide", min_len=lo, max_len=hi)
+            if only:
+                cfg["rules"] = {key: key == only for key in RULE_BITS}
+            params = cp.asarray(make_pattern_params(cfg))
+            kernel(((len(addresses)+127)//128,), (128,),
+                   (encoded, np.int32(len(addresses)), params, output))
+            hits = output.get()
+            for address, hit in zip(addresses, hits):
+                assert not classify_vanity(address, cfg) or hit, (cfg, address)
+                comparisons += 1
+    print("✓ 实际 CUDA 粗筛/CPU 分类对照: {} 项无漏筛".format(comparisons))
+
+
+def verify_host_screen():
+    """Execute the unmodified CUDA predicate as native C++ (not a GPU test)."""
+    import ctypes
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    from test_vanity import fixtures
+    from cpu_worker import classify_vanity, RULE_BITS, rule_mask
+    source = Path(KERNEL_PATH).read_text(encoding="utf-8")
+    source = source[source.index("__device__ __forceinline__ char lower58"):source.index("// Test entry point")]
+    source = source.replace("__device__", "").replace("__forceinline__", "inline")
+    source += '\nextern "C" __declspec(dllexport) int host_screen(const char *a, int lo, int hi, int mask) { return wide_candidate(a,lo,hi,mask); }\n'
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory)/"screen.cpp"
+        path.write_text(source, encoding="utf-8")
+        library = Path(directory)/"screen.dll"
+        compiled = subprocess.run([sys.executable, "-m", "ziglang", "c++", "-shared", "-O2",
+                                   "-nostdlib++", "-std=c++14", str(path), "-o", str(library)],
+                                  capture_output=True)
+        if compiled.returncode:
+            raise RuntimeError(compiled.stderr.decode(errors="replace"))
+        lib = ctypes.CDLL(str(library))
+        fn = lib.host_screen
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        fn.restype = ctypes.c_int
+        comparisons = 0
+        addresses = list(fixtures())
+        for lo, hi in ((2,5),(5,8),(8,8),(8,12),(8,34),(9,34),(12,34),(34,34)):
+            for only in [None]+list(RULE_BITS):
+                config = dict(mode="wide", min_len=lo, max_len=hi)
+                if only:
+                    config["rules"] = {key: key == only for key in RULE_BITS}
+                for address in addresses:
+                    hit = fn(address.encode(), lo, hi, rule_mask(config))
+                    assert not classify_vanity(address, config) or hit, (config, address)
+                    comparisons += 1
+        print("Host execution of actual coarse predicate: {} comparisons, no false negatives (not GPU execution).".format(comparisons))
+        # Windows holds loaded DLLs open until FreeLibrary.
+        import _ctypes
+        _ctypes.FreeLibrary(lib._handle)
+    return 0
+
+
+def compile_offline():
+    """NVRTC -> PTX; compilation only, does not imply GPU execution passed."""
+    import ctypes as c
+    from pathlib import Path
+    import site
+    locations = [path for root in site.getsitepackages()
+                 for path in Path(root).glob("nvidia/cuda_nvrtc/bin/nvrtc64_*.dll")
+                 if ".alt." not in path.name]
+    if not locations:
+        raise RuntimeError("未找到 Windows NVRTC DLL；安装 nvidia-cuda-nvrtc-cu12")
+    with os.add_dll_directory(str(locations[0].parent)):
+        lib = c.CDLL(str(locations[0]))
+        lib.nvrtcCreateProgram.argtypes = [c.POINTER(c.c_void_p), c.c_char_p, c.c_char_p,
+                                          c.c_int, c.c_void_p, c.c_void_p]
+        lib.nvrtcCompileProgram.argtypes = [c.c_void_p, c.c_int, c.POINTER(c.c_char_p)]
+        lib.nvrtcGetProgramLogSize.argtypes = [c.c_void_p, c.POINTER(c.c_size_t)]
+        lib.nvrtcGetProgramLog.argtypes = [c.c_void_p, c.c_void_p]
+        lib.nvrtcGetPTXSize.argtypes = [c.c_void_p, c.POINTER(c.c_size_t)]
+        lib.nvrtcDestroyProgram.argtypes = [c.POINTER(c.c_void_p)]
+        source = Path(KERNEL_PATH).read_bytes()
+        for mode in (0, 1, -1):
+            for points in (8, 16, 24, 32):
+                program = c.c_void_p()
+                assert lib.nvrtcCreateProgram(c.byref(program), source, b"kernels.cu", 0, None, None) == 0
+                options = [b"--std=c++14", b"--gpu-architecture=compute_75", b"--use_fast_math",
+                           ("-DPOINTS_PER_THREAD="+str(points)).encode(), ("-DSEARCH_MODE="+str(mode)).encode()]
+                result = lib.nvrtcCompileProgram(program, len(options), (c.c_char_p*len(options))(*options))
+                size = c.c_size_t()
+                lib.nvrtcGetProgramLogSize(program, c.byref(size))
+                log = c.create_string_buffer(size.value)
+                lib.nvrtcGetProgramLog(program, log)
+                if result:
+                    raise RuntimeError(log.value.decode())
+                assert lib.nvrtcGetPTXSize(program, c.byref(size)) == 0
+                lib.nvrtcDestroyProgram(c.byref(program))
+                print("NVRTC OK: mode={} M={} PTX={} bytes (未执行 GPU)".format(mode, points, size.value), flush=True)
+    return 0
+
+
 def main():
+    if "--host-screen" in sys.argv:
+        return verify_host_screen()
+    if "--compile-only" in sys.argv:
+        return compile_offline()
     try:
         cp.cuda.Device(0).use()
         n_dev = cp.cuda.runtime.getDeviceCount()
@@ -104,14 +251,26 @@ def main():
         print("✗ CUDA 初始化失败: {}".format(e))
         print("  请确认 NVIDIA 驱动已安装, GPU 可用 (跑 nvidia-smi 测试).")
         return 1
+    verify_screen()
     all_ok = True
-    for M in (8, 16):
-        ok = verify_with_m(M)
+    passed = []
+    for M in (8, 16, 24, 32):
+        try:
+            ok = verify_with_m(M)
+        except AssertionError:
+            raise
+        except Exception as exc:
+            if M in (24, 32):
+                print("M={} 不可用，保留 8/16 回退: {}".format(M, exc))
+                continue
+            raise
         if not ok:
             all_ok = False
+        else:
+            passed.append(M)
     print()
     if all_ok:
-        print("✓ M=8 和 M=16 两种配置都通过验证")
+        print("✓ M={} 配置通过验证".format(passed))
         print("  Montgomery 批量求逆 + GPU 持久化状态 + 全部加密原语 OK")
         return 0
     else:

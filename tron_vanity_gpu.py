@@ -7,7 +7,13 @@ import multiprocessing as mp
 import signal
 import atexit
 from datetime import datetime
-from queue import Empty
+import json
+import math
+import statistics
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from cpu_worker import (classify_batch, gen_startpoints_batch, init_classifier,
+                        validate_config, split_targets, rule_mask)
 if getattr(sys, "frozen", False):
     _base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
     for _rel in ("", os.path.join("nvidia", "cuda_runtime", "bin"), os.path.join("nvidia", "cuda_nvrtc", "bin")):
@@ -92,79 +98,14 @@ def cpu_priv_to_address(priv_int: int) -> str:
     payload = b"\x41" + k.digest()[-20:]
     checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
     return base58.b58encode(payload + checksum).decode()
-def validate_pattern(prefix: str, suffix: str):
-    errs = []
-    min_effective_chars = 4
-    if prefix:
-        if prefix[0] != "T":
-            errs.append("前缀必须以 'T' 开头 (所有 TRON 地址都以 T 开头)")
-        bad = sorted({c for c in prefix if c not in BASE58_SET})
-        if bad:
-            errs.append("前缀含非 Base58 字符: {} (Base58 不含 0、O、I、l)".format(bad))
-        if len(prefix) > ADDRESS_LEN:
-            errs.append("前缀过长 (地址总长 34)")
-    if suffix:
-        bad = sorted({c for c in suffix if c not in BASE58_SET})
-        if bad:
-            errs.append("后缀含非 Base58 字符: {}".format(bad))
-        if len(suffix) > ADDRESS_LEN:
-            errs.append("后缀过长 (地址总长 34)")
-    if prefix and suffix and len(prefix) + len(suffix) > ADDRESS_LEN:
-        errs.append("前缀+后缀长度之和超过 34")
-    effective_chars = max(0, len(prefix) - 1) + len(suffix)
-    if effective_chars < min_effective_chars:
-        errs.append(
-            "条件太宽泛, 至少需要 4 个有效 Base58 字符 "
-            "(前缀开头的 T 不计入; 例如 TX888 或后缀 8888)"
-        )
-    return errs
-def estimate_probability(prefix: str, suffix: str, repeat_tail: int) -> float:
-    p = 1.0
-    if prefix:
-        extra = len(prefix) - 1
-        if extra > 0:
-            p *= (1.0 / 58) ** extra
-    if suffix:
-        p *= (1.0 / 58) ** len(suffix)
-    if repeat_tail > 0:
-        p *= 58.0 * (1.0 / 58) ** repeat_tail
-    return p
-def input_with_timeout(prompt: str, timeout: float):
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
-    if sys.platform == "win32":
-        import msvcrt
-        start = time.time()
-        buf = []
-        while time.time() - start < timeout:
-            if msvcrt.kbhit():
-                ch = msvcrt.getwch()
-                if ch in ("\r", "\n"):
-                    sys.stdout.write("\n")
-                    return "".join(buf)
-                if ch == "\x03":
-                    raise KeyboardInterrupt
-                if ch == "\b":
-                    if buf:
-                        buf.pop()
-                        sys.stdout.write("\b \b")
-                        sys.stdout.flush()
-                else:
-                    buf.append(ch)
-                    sys.stdout.write(ch)
-                    sys.stdout.flush()
-            time.sleep(0.03)
-        sys.stdout.write("\n")
-        return None
-    import select
-    ready, _, _ = select.select([sys.stdin], [], [], timeout)
-    if ready:
-        line = sys.stdin.readline()
-        if not line:
-            return None
-        return line.rstrip("\n")
-    sys.stdout.write("\n")
-    return None
+def validate_pattern(prefix, suffix, combine_or=False):
+    try:
+        validate_config(dict(mode="exact", prefix=prefix, suffix=suffix, combine_or=combine_or))
+        return []
+    except ValueError as exc:
+        return [str(exc)]
+
+
 def fmt_time(seconds):
     if seconds is None or seconds != seconds or seconds == float("inf") or seconds < 0:
         return "?"
@@ -197,11 +138,11 @@ APP_BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "f
 RESOURCE_BASE_DIR = getattr(sys, "_MEIPASS", APP_BASE_DIR)
 KERNEL_PATH = os.path.join(RESOURCE_BASE_DIR, "kernels.cu")
 PATTERN_DTYPE = np.dtype([
-    ("prefix_len", np.int32),
-    ("suffix_len", np.int32),
-    ("repeat_n",   np.int32),
-    ("prefix",     np.uint8, 40),
-    ("suffix",     np.uint8, 40),
+    ("mode", np.int32), ("combine_or", np.int32),
+    ("prefix_count", np.int32), ("suffix_count", np.int32),
+    ("min_len", np.int32), ("max_len", np.int32), ("rules", np.int32),
+    ("prefix_len", np.int32, 8), ("suffix_len", np.int32, 8),
+    ("prefixes", np.uint8, (8, 40)), ("suffixes", np.uint8, (8, 40)),
 ], align=True)
 MATCH_DTYPE = np.dtype([
     ("thread_id", np.uint32),
@@ -210,11 +151,12 @@ MATCH_DTYPE = np.dtype([
     ("address",   np.uint8, 34),
     ("_pad2",     np.uint8, 6),
 ], align=True)
-def load_kernel(arch=None, points_per_thread=8):
+def load_kernel(arch=None, points_per_thread=8, mode=None):
     with open(KERNEL_PATH, "r", encoding="utf-8") as f:
         src = f.read()
     options = ["-std=c++14", "--use_fast_math",
-               "-DPOINTS_PER_THREAD={}".format(points_per_thread)]
+               "-DPOINTS_PER_THREAD={}".format(points_per_thread),
+               "-DSEARCH_MODE={}".format(-1 if mode is None else int(mode == "wide"))]
     if arch:
         options.append("-arch=" + arch)
     module = cp.RawModule(
@@ -225,8 +167,35 @@ def load_kernel(arch=None, points_per_thread=8):
     )
     return module.get_function("vanity_kernel")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cpu_worker import cpu_worker, gen_startpoints_batch
-def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
+
+def make_pattern_params(cfg):
+    validate_config(cfg)
+    pp_local = np.zeros(1, dtype=PATTERN_DTYPE)
+    pp_local["mode"] = 1 if cfg.get("mode") == "wide" else 0
+    pp_local["combine_or"] = int(bool(cfg.get("combine_or", False)))
+    ps = split_targets(cfg.get("prefix", ""))
+    ss = split_targets(cfg.get("suffix", ""))
+    pp_local["prefix_count"] = len(ps)
+    pp_local["suffix_count"] = len(ss)
+    pp_local["min_len"] = int(cfg.get("min_len", 8))
+    pp_local["max_len"] = int(cfg.get("max_len", 34))
+    pp_local["rules"] = rule_mask(cfg)
+    for i, value in enumerate(ps):
+        pp_local["prefix_len"][0, i] = len(value)
+        pp_local["prefixes"][0, i, :len(value)] = np.frombuffer(value.encode(), dtype=np.uint8)
+    for i, value in enumerate(ss):
+        pp_local["suffix_len"][0, i] = len(value)
+        pp_local["suffixes"][0, i, :len(value)] = np.frombuffer(value.encode(), dtype=np.uint8)
+    return pp_local
+
+def run_search(config: dict, output_path: str, duration_minutes: float = 0):
+    validate_config(config)
+    if not math.isfinite(duration_minutes) or duration_minutes < 0:
+        raise ValueError("运行时间必须为有限的非负数")
+    mode = config["mode"]
+    prefix = config.get("prefix", "")
+    suffix = config.get("suffix", "")
+    combine_or = bool(config.get("combine_or", False))
     try:
         n_dev = cp.cuda.runtime.getDeviceCount()
     except Exception as e:
@@ -254,26 +223,24 @@ def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
             "✗ GPU 计算能力 {}.{} 太低 (需要 ≥ 7.0, 即 RTX 20 系或更新).\n"
             "  当前 GPU: {}\n".format(cc_major, cc_minor, gpu_name))
         sys.exit(1)
-    M_CANDIDATES = [16, 8]
+    M_CANDIDATES = [32, 24, 16, 8]
     POINTS_PER_THREAD = None
     THREADS_PER_BLOCK = 64
     BLOCKS_PER_SM = 4
     n_blocks = n_sms * BLOCKS_PER_SM
     n_threads = n_blocks * THREADS_PER_BLOCK
     STEPS_PER_LAUNCH = 128
-    MAX_MATCHES = 4096
-    MATCH_QUEUE_SIZE = 8192
-    HIT_PAUSE_THRESHOLD = 50
+    MAX_MATCHES = 16384
     N_STREAMS = 2
     cpu_count = mp.cpu_count()
-    cpu_reserved = max(1, (cpu_count + 9) // 10)
-    n_cpu_workers = max(1, cpu_count - cpu_reserved)
     parts = []
-    if prefix:      parts.append("前缀={}".format(prefix))
-    if suffix:      parts.append("后缀={}".format(suffix))
-    if repeat_tail: parts.append("尾部重复≥{}位".format(repeat_tail))
-    pattern_desc = " 且 ".join(parts)
-    prob = estimate_probability(prefix, suffix, repeat_tail)
+    if mode == "wide":
+        pattern_desc = "全地址靓号宽筛 {}-{} 位".format(config.get("min_len", 8), config.get("max_len", 34))
+    else:
+        if prefix: parts.append("前缀={}".format(prefix))
+        if suffix: parts.append("后缀={}".format(suffix))
+        pattern_desc = (" OR " if combine_or else " AND ").join(parts)
+    prob = 0.0  # Overlapping rules do not have a reliable simple ETA.
     print()
     print("=" * 70)
     print("  TRON 靓号生成器 — GPU + CPU 全速版")
@@ -281,8 +248,7 @@ def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
     print("  GPU 设备     : {}".format(gpu_name))
     print("  计算能力     : {}.{}   SM 数: {}".format(cc_major, cc_minor, n_sms))
     print("  GPU 并发线程 : {} (= {} block × {})".format(n_threads, n_blocks, THREADS_PER_BLOCK))
-    print("  CPU 工作进程 : {} (本机 {} 核, 预留 {} 核约 10%)".format(
-        n_cpu_workers, cpu_count, cpu_reserved))
+    print("  CPU 分类      : GPU 命中后二次校验和分类 (CPU 暴力搜索关闭, 本机 {} 核)".format(cpu_count))
     print("  搜索模式     : {}".format(pattern_desc))
     if prob > 0:
         print("  理论概率     : 平均 {} 个地址出 1 个".format(fmt_num(1 / prob)))
@@ -291,50 +257,35 @@ def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
     print("=" * 70)
     print()
     print()
-    print("自适应选择 Montgomery 批量求逆参数 M (8 / 16)...")
+    print("按当前模式实测 M (8 / 16 / 24 / 32)...")
     arch = "sm_{}{}".format(cc_major, cc_minor)
     def _bench_m(m_val):
         try:
-            k = load_kernel(arch=arch, points_per_thread=m_val)
-        except Exception as e:
-            return None, "编译失败: {}".format(e)
-        bench_threads = 256
-        bench_blocks = 4
-        bench_chains = bench_threads * m_val
-        pub_bench = coincurve.PublicKey.from_valid_secret((2).to_bytes(32, "big")).format(compressed=False)
-        x_bench = int.from_bytes(pub_bench[1:33], "big")
-        y_bench = int.from_bytes(pub_bench[33:65], "big")
-        sx = np.empty(bench_chains * 4, dtype=np.uint64)
-        sy = np.empty(bench_chains * 4, dtype=np.uint64)
-        for j in range(4):
-            sx[j::4] = (x_bench >> (64 * j)) & 0xFFFFFFFFFFFFFFFF
-            sy[j::4] = (y_bench >> (64 * j)) & 0xFFFFFFFFFFFFFFFF
-        cur_x = cp.asarray(sx)
-        cur_y = cp.asarray(sy)
-        pp_b = np.zeros(1, dtype=PATTERN_DTYPE)
-        pp_b["repeat_n"] = 30
-        pp_b_dev = cp.asarray(pp_b)
-        m_d = cp.zeros(64, dtype=MATCH_DTYPE)
-        c_d = cp.zeros(1, dtype=cp.uint32)
-        STEPS = 16
-        try:
-            k((bench_blocks,), (THREADS_PER_BLOCK,),
-              (cur_x, cur_y, np.int32(STEPS), np.uint64(0),
-                pp_b_dev, m_d, c_d, np.uint32(64)))
-            cp.cuda.Stream.null.synchronize()
-        except Exception as e:
-            return None, "运行失败: {}".format(e)
-        STEPS = 64
-        cp.cuda.runtime.memsetAsync(c_d.data.ptr, 0, 4, 0)
-        cp.cuda.Stream.null.synchronize()
-        t0 = time.time()
-        k((bench_blocks,), (THREADS_PER_BLOCK,),
-          (cur_x, cur_y, np.int32(STEPS), np.uint64(0),
-           pp_b_dev, m_d, c_d, np.uint32(64)))
-        cp.cuda.Stream.null.synchronize()
-        elapsed = time.time() - t0
-        addrs = bench_threads * STEPS * m_val
-        return (addrs / elapsed, k), None
+            k = load_kernel(arch=arch, points_per_thread=m_val, mode=mode)
+            # Use the production grid and independent random starts. A small,
+            # identical-point microbenchmark biases both occupancy and hits.
+            xb, yb, _ = gen_startpoints_batch(n_threads*m_val)
+            sx = np.frombuffer(xb, dtype=">u8").reshape(-1, 4)[:, ::-1].astype(np.uint64).ravel()
+            sy = np.frombuffer(yb, dtype=">u8").reshape(-1, 4)[:, ::-1].astype(np.uint64).ravel()
+            cur_x, cur_y = cp.asarray(sx), cp.asarray(sy)
+            params = cp.asarray(make_pattern_params(config))
+            hits, count = cp.zeros(16384, dtype=MATCH_DTYPE), cp.zeros(1, dtype=cp.uint32)
+            samples = []
+            for trial in range(4):
+                count.fill(0)
+                cp.cuda.Stream.null.synchronize()
+                begin, end = cp.cuda.Event(), cp.cuda.Event()
+                begin.record()
+                k((n_blocks,), (THREADS_PER_BLOCK,),
+                  (cur_x, cur_y, np.int32(16), np.uint64(trial*16),
+                   params, hits, count, np.uint32(len(hits))))
+                end.record()
+                end.synchronize()
+                if trial:
+                    samples.append(n_threads*m_val*16 / (cp.cuda.get_elapsed_time(begin, end)/1000))
+            return (statistics.median(samples), k), None
+        except Exception as exc:
+            return None, "编译或运行失败: {}".format(exc)
     best_rate, best_M, best_kernel = 0.0, None, None
     for M_try in M_CANDIDATES:
         result, err = _bench_m(M_try)
@@ -356,13 +307,13 @@ def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
     POINTS_PER_THREAD = best_M
     kernel = best_kernel
     BATCH = n_threads * STEPS_PER_LAUNCH * POINTS_PER_THREAD
-    print("→ 选用 M={} (摊销 {:.0f} mul/点, ECC 部分最快)".format(
+    print("→ 选用 M={} (摊销 {:.0f} mul/点, 当前模式实测最快)".format(
         POINTS_PER_THREAD, 256 / POINTS_PER_THREAD + 3))
     print()
     print("GPU 自检: 单线程执行 1 步 (M={}个点)...".format(POINTS_PER_THREAD))
     self_t0 = time.time()
     try:
-        k_tests = list(range(1, POINTS_PER_THREAD + 1))
+        k_tests = list(range(2, POINTS_PER_THREAD + 2))
         sx_test = np.zeros(POINTS_PER_THREAD * 4, dtype=np.uint64)
         sy_test = np.zeros(POINTS_PER_THREAD * 4, dtype=np.uint64)
         for p, k_test in enumerate(k_tests):
@@ -375,14 +326,15 @@ def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
         cur_x_test = cp.asarray(sx_test)
         cur_y_test = cp.asarray(sy_test)
         pp_test = np.zeros(1, dtype=PATTERN_DTYPE)
-        pp_test["prefix_len"] = 1
-        pp_test["suffix_len"] = 0
-        pp_test["repeat_n"] = 0
-        pp_test["prefix"][0, 0] = ord("T")
+        pp_test["mode"] = 0
+        pp_test["prefix_count"] = 1
+        pp_test["prefix_len"][0, 0] = 1
+        pp_test["prefixes"][0, 0, 0] = ord("T")
         pp_test_dev = cp.asarray(pp_test)
         m_test = cp.zeros(POINTS_PER_THREAD * 2, dtype=MATCH_DTYPE)
         c_test = cp.zeros(1, dtype=cp.uint32)
-        kernel(
+        check_kernel = load_kernel(arch=arch, points_per_thread=POINTS_PER_THREAD)
+        check_kernel(
             (1,), (1,),
             (cur_x_test, cur_y_test, np.int32(1), np.uint64(0),
              pp_test_dev, m_test, c_test, np.uint32(POINTS_PER_THREAD * 2))
@@ -394,7 +346,7 @@ def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
         matches_back = m_test[:n].get()
         for m in matches_back:
             packed = int(m["thread_id"])
-            p_idx = packed & 0xF
+            p_idx = packed % POINTS_PER_THREAD
             addr_gpu = bytes(m["address"]).decode("ascii")
             addr_cpu = cpu_priv_to_address(k_tests[p_idx])
             if addr_gpu != addr_cpu:
@@ -406,33 +358,8 @@ def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
         print("  请检查: nvidia-smi 是否能看到 GPU; 显存是否充足; 驱动是否最新")
         sys.exit(1)
     print()
-    pp = np.zeros(1, dtype=PATTERN_DTYPE)
-    pp["prefix_len"] = len(prefix)
-    pp["suffix_len"] = len(suffix)
-    pp["repeat_n"]   = repeat_tail
-    if prefix: pp["prefix"][0, :len(prefix)] = np.frombuffer(prefix.encode(), dtype=np.uint8)
-    if suffix: pp["suffix"][0, :len(suffix)] = np.frombuffer(suffix.encode(), dtype=np.uint8)
+    pp = make_pattern_params(config)
     pp_dev = cp.asarray(pp)
-    try:
-        matches_dev_list = [cp.zeros(MAX_MATCHES, dtype=MATCH_DTYPE) for _ in range(N_STREAMS)]
-        count_dev_list   = [cp.zeros(1, dtype=cp.uint32) for _ in range(N_STREAMS)]
-        matches_host_list = [cp.cuda.alloc_pinned_memory(MATCH_DTYPE.itemsize * MAX_MATCHES)
-                             for _ in range(N_STREAMS)]
-        count_host_list   = [cp.cuda.alloc_pinned_memory(4) for _ in range(N_STREAMS)]
-    except cp.cuda.memory.OutOfMemoryError as e:
-        sys.stderr.write(
-            "✗ GPU 显存不足: {}\n"
-            "  当前 GPU: {} (需要至少 ~500MB 显存空间)\n"
-            "  请关掉其他占用 GPU 的程序 (浏览器硬件加速、游戏、其他 CUDA 任务) 后重试.\n".format(e, gpu_name))
-        sys.exit(1)
-    matches_host_np_list = [
-        np.frombuffer(matches_host_list[s], dtype=MATCH_DTYPE, count=MAX_MATCHES)
-        for s in range(N_STREAMS)
-    ]
-    count_host_np_list = [
-        np.frombuffer(count_host_list[s], dtype=np.uint32, count=1)
-        for s in range(N_STREAMS)
-    ]
     pts_per_stream = n_threads * POINTS_PER_THREAD
     total_pts = pts_per_stream * N_STREAMS
     print("生成 {} 个 GPU 起始点 ({} 套 × {} 线程 × {} 点, 用 {} 个 CPU 核并行)...".format(
@@ -493,7 +420,8 @@ def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
     pp_warmup_dev = cp.asarray(pp)
     m_warmup = cp.zeros(MAX_MATCHES, dtype=MATCH_DTYPE)
     c_warmup = cp.zeros(1, dtype=cp.uint32)
-    warmup_state = stream_state[0]
+    warmup_state = {"cur_x": stream_state[0]["cur_x"].copy(),
+                    "cur_y": stream_state[0]["cur_y"].copy()}
     cp.cuda.Stream.null.synchronize()
     t_warm = time.time()
     WARMUP_STEPS = 64
@@ -505,12 +433,17 @@ def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
     )
     cp.cuda.Stream.null.synchronize()
     elapsed_warm = time.time() - t_warm
-    warmup_state["step_offset"] += WARMUP_STEPS
     warmup_hits = int(c_warmup.get()[0])
     target_sec = 1.5
     per_step = elapsed_warm / WARMUP_STEPS
-    STEPS_PER_LAUNCH = max(16, int(target_sec / max(per_step, 1e-6)))
-    STEPS_PER_LAUNCH = max(16, min(STEPS_PER_LAUNCH, 4096))
+    STEPS_PER_LAUNCH = max(1, int(target_sec / max(per_step, 1e-6)))
+    STEPS_PER_LAUNCH = max(1, min(STEPS_PER_LAUNCH, 2048))
+    if warmup_hits > 0:
+        # Keep the GPU->CPU candidate batch bounded.  The wide screen is
+        # intentionally recall-first, so shorten launches rather than drop
+        # candidates when a GPU produces a dense structural region.
+        estimated_steps = int((MAX_MATCHES * 0.5) / max(warmup_hits / float(WARMUP_STEPS), 1e-9))
+        STEPS_PER_LAUNCH = max(1, min(STEPS_PER_LAUNCH, estimated_steps))
     BATCH = n_threads * STEPS_PER_LAUNCH * POINTS_PER_THREAD
     print("  warmup: {} 步用 {:.2f}s ({:.2f}ms/步)".format(WARMUP_STEPS, elapsed_warm, per_step * 1000))
     if warmup_hits > MAX_MATCHES:
@@ -518,445 +451,327 @@ def run_search(prefix: str, suffix: str, repeat_tail: int, output_path: str):
     print("  自适应 STEPS_PER_LAUNCH = {} (预期 ~{:.1f}s/launch, ~{:.1f}M 地址/launch)".format(
         STEPS_PER_LAUNCH, STEPS_PER_LAUNCH * per_step, BATCH / 1e6))
     print()
-    ctx = mp.get_context("spawn")
-    match_q = ctx.Queue(maxsize=MATCH_QUEUE_SIZE)
-    stat_q  = ctx.Queue(maxsize=4096)
-    stop_evt  = ctx.Event()
-    pause_evt = ctx.Event()
-    cpu_procs = []
-    for _ in range(n_cpu_workers):
-        p = ctx.Process(target=cpu_worker,
-                        args=(prefix, suffix, repeat_tail,
-                              match_q, stat_q, stop_evt, pause_evt),
-                        daemon=True)
-        p.start()
-        cpu_procs.append(p)
-    session_start = time.time()
-    cycle_start   = session_start
-    gpu_total     = 0
-    cpu_total     = 0
-    matches_found = 0
-    session_gpu_total = 0
-    session_cpu_total = 0
-    session_matches_found = 0
-    gpu_dropped_matches = 0
-    cpu_dropped_matches = 0
-    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(N_STREAMS)]
-    in_flight = [False] * N_STREAMS
-    def save_matches(records):
-        if not records:
+    return run_pipeline(kernel, pp_dev, config, output_path, duration_minutes,
+                        stream_state, n_blocks, THREADS_PER_BLOCK, POINTS_PER_THREAD,
+                        STEPS_PER_LAUNCH, MAX_MATCHES)
+
+
+def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
+                 n_blocks, block_size, points, launch_steps, capacity):
+    """Double-stream generation with bounded asynchronous CPU classification.
+
+    Each launch checkpoints its curve state. Overflow replays that exact range
+    in smaller launches; no candidate is discarded to enforce a rate limit.
+    """
+    import sqlite3
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in states]
+    n_threads = n_blocks * block_size
+    # The device counter is uint32, including for very broad user filters.
+    launch_steps = min(launch_steps, (2**32-1)//(n_threads*points))
+    if launch_steps < 1:
+        raise ValueError("GPU 网格超过命中计数器容量")
+    buffers = []
+
+    def allocate(size):
+        pinned = cp.cuda.alloc_pinned_memory(MATCH_DTYPE.itemsize * size)
+        count_host = cp.cuda.alloc_pinned_memory(4)
+        return {"device": cp.empty(size, dtype=MATCH_DTYPE),
+                "count": cp.zeros(1, dtype=cp.uint32), "pinned": pinned,
+                "host": np.frombuffer(pinned, dtype=MATCH_DTYPE),
+                "count_host": count_host,
+                "count_view": np.frombuffer(count_host, dtype=np.uint32), "capacity": size}
+
+    for state in states:
+        state["backup_x"] = cp.empty_like(state["cur_x"])
+        state["backup_y"] = cp.empty_like(state["cur_y"])
+        buffers.append(allocate(capacity))
+    cp.cuda.Stream.null.synchronize()
+    workers = max(1, min(8, mp.cpu_count()-1))
+    pending, order = deque(), deque()
+    unsubmitted = []
+    batches = iter(())
+    metrics = {"addresses": 0, "candidates": 0, "classified": 0, "saved": 0,
+               "overflow_replays": 0, "dropped_candidates": 0, "backpressure_seconds": 0.0}
+    started = time.monotonic()
+    deadline = started + duration_minutes*60 if duration_minutes else float("inf")
+    interrupted = threading.Event()
+    display_stop = threading.Event()
+    old_handlers = {}
+    for sig in (signal.SIGINT, getattr(signal, "SIGBREAK", signal.SIGINT)):
+        if sig not in old_handlers:
+            old_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, lambda *_: interrupted.set())
+    initial_steps = launch_steps
+    last_warning = [0.0]
+    hardware_totals, hardware_counts = [0.0, 0.0], [0, 0]
+
+    def warn(message):
+        now = time.monotonic()
+        if now-last_warning[0] >= 10:
+            print("\n[警告] " + message)
+            last_warning[0] = now
+
+    def launch(idx, steps):
+        state, buf, stream = states[idx], buffers[idx], streams[idx]
+        state["batch_start"], state["batch_steps"] = state["step_offset"], steps
+        with stream:
+            cp.copyto(state["backup_x"], state["cur_x"])
+            cp.copyto(state["backup_y"], state["cur_y"])
+            buf["count"].fill(0)
+            kernel((n_blocks,), (block_size,),
+                   (state["cur_x"], state["cur_y"], np.int32(steps),
+                    np.uint64(state["batch_start"]), params, buf["device"],
+                    buf["count"], np.uint32(buf["capacity"])), stream=stream)
+            cp.cuda.runtime.memcpyAsync(buf["count_host"].ptr, buf["count"].data.ptr, 4,
+                                       cp.cuda.runtime.memcpyDeviceToHost, stream.ptr)
+        state["step_offset"] += steps
+
+    def collect(idx):
+        nonlocal launch_steps
+        state, stream, buf = states[idx], streams[idx], buffers[idx]
+        stream.synchronize()
+        count, steps = int(buf["count_view"][0]), state["batch_steps"]
+        if count > buf["capacity"]:
+            metrics["overflow_replays"] += 1
+            warn("GPU 缓冲溢出：重放原区间并缩短批次，不丢弃候选。")
+            with stream:
+                cp.copyto(state["cur_x"], state["backup_x"])
+                cp.copyto(state["cur_y"], state["backup_y"])
+            stream.synchronize()
+            state["step_offset"] = state["batch_start"]
+            if steps == 1:
+                # One candidate per point, bounded by n_threads*points.
+                buffers[idx] = allocate(count)
+                cp.cuda.Stream.null.synchronize()
+                launch(idx, 1)
+                yield from collect(idx)
+            else:
+                launch_steps = max(1, min(launch_steps, steps//2))
+                remaining = steps
+                while remaining:
+                    part = min(remaining, launch_steps)
+                    launch(idx, part)
+                    yield from collect(idx)
+                    remaining -= part
             return
+        if count:
+            cp.cuda.runtime.memcpyAsync(buf["pinned"].ptr, buf["device"].data.ptr,
+                                       count*MATCH_DTYPE.itemsize,
+                                       cp.cuda.runtime.memcpyDeviceToHost, stream.ptr)
+            stream.synchronize()
+        # Copy before reusing pinned memory on the next stream launch.
+        result = buf["host"][:count].copy()
+        if count > buf["capacity"]//2:
+            launch_steps = max(1, min(launch_steps, int(steps*buf["capacity"]/(2*count))))
+        yield result, steps
+
+    def status():
+        while not display_stop.wait(1):
+            elapsed = max(time.monotonic()-started, 0.001)
+            gpu, cpu = _gpu_stats(), _cpu_percent()
+            for column, value in enumerate((gpu[0] if gpu else None, cpu)):
+                if value is not None:
+                    hardware_totals[column] += value
+                    hardware_counts[column] += 1
+            print("\rGPU {}/秒 | 候选 {}/秒 | 已分类 {} | 已保存 {} | 待处理 {}{}{}   ".format(
+                fmt_num(metrics["addresses"]/elapsed), fmt_num(metrics["candidates"]/elapsed),
+                metrics["classified"], metrics["saved"], len(pending),
+                " | GPU {:.0f}%".format(gpu[0]) if gpu else "",
+                " | CPU {:.0f}%".format(cpu) if cpu is not None else ""), end="", flush=True)
+            if metrics["candidates"]/elapsed > 10000:
+                warn("候选持续超过每秒一万个；保留规则，必要时等待 CPU 清空队列。")
+
+    def candidates_from(arr, idx):
+        keys = states[idx]["base_keys"]
+        result = []
+        for item in arr:
+            chain, step = int(item["thread_id"]), int(item["step"])
+            if chain >= len(keys):
+                raise RuntimeError("GPU 命中索引越界")
+            private_key = (keys[chain]+step) % SECP256K1_N
+            result.append((private_key.to_bytes(32, "big").hex(),
+                           bytes(item["address"]).decode("ascii")))
+        return result
+
+    # Disk-backed dedup avoids unbounded RAM growth in an unlimited search.
+    index = sqlite3.connect(output_path + ".index.sqlite3")
+    index.execute("CREATE TABLE IF NOT EXISTS addresses (address TEXT PRIMARY KEY)")
+    output = open(output_path, "a", encoding="utf-8")
+    pool = ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"),
+                               initializer=init_classifier)
+    display = threading.Thread(target=status, daemon=True)
+    display.start()
+    error = None
+
+    def finish_one():
+        future, raw = pending[0]
+        records = future.result()  # propagate verification/worker errors
+        saved = 0
         try:
-            with open(output_path, "a", encoding="utf-8") as f:
-                now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                for priv_hex, addr, source in records:
-                    f.write("=" * 70 + "\n")
-                    f.write("时间          : {}\n".format(now_text))
-                    f.write("匹配模式      : {}\n".format(pattern_desc))
-                    f.write("来源          : {}\n".format(source))
-                    f.write("地址          : {}\n".format(addr))
-                    f.write("私钥 (hex)    : {}\n".format(priv_hex))
-                    f.write("=" * 70 + "\n\n")
-        except OSError as e:
-            sys.stderr.write(
-                "\n⚠ 写命中文件失败 ({}): {}\n"
-                "  本批 {} 个命中未能写入文件, 请从终端输出或重新运行获取.\n".format(
-                    output_path, e, len(records)))
-    def drain_cpu_stats():
-        nonlocal cpu_total, cpu_dropped_matches
-        added = 0
-        dropped = 0
-        try:
-            while True:
-                item = stat_q.get_nowait()
-                if isinstance(item, tuple):
-                    added += item[0]
-                    dropped += item[1]
-                else:
-                    added += item
-        except Empty:
-            pass
-        cpu_total += added
-        cpu_dropped_matches += dropped
-        return added
-    def drain_cpu_matches():
-        ms = []
-        try:
-            while True:
-                ms.append(match_q.get_nowait())
-        except Empty:
-            pass
-        return ms
-    hw_cache = {"t": 0.0, "gpu": None, "cpu": None}
-    def get_hw_stats(now):
-        if now - hw_cache["t"] >= 1.0:
-            hw_cache["gpu"] = _gpu_stats()
-            hw_cache["cpu"] = _cpu_percent()
-            hw_cache["t"] = now
-        return hw_cache["gpu"], hw_cache["cpu"]
-    status_stop = threading.Event()
-    status_paused = threading.Event()
-    status_state = {"matches_found": 0, "last_width": 0}
-    def _display_width(s):
-        w = 0
-        for ch in s:
-            o = ord(ch)
-            if o < 0x80:
-                w += 1
-            else:
-                w += 2
-        return w
-    def _term_cols():
-        try:
-            return os.get_terminal_size().columns
+            for record in records:
+                if index.execute("INSERT OR IGNORE INTO addresses VALUES (?)", (record["address"],)).rowcount:
+                    output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    saved += 1
+            if saved:
+                output.flush()
+                os.fsync(output.fileno())
+            index.commit()
         except Exception:
-            return 80
-    def status_loop():
-        while not status_stop.is_set():
-            try:
-                time.sleep(0.5)
-                if status_paused.is_set():
-                    continue
-                now = time.time()
-                cycle_elapsed = now - cycle_start
-                elapsed = max(cycle_elapsed, 0.001)
-                g_rate = gpu_total / elapsed
-                c_rate = cpu_total / elapsed
-                total_rate = g_rate + c_rate
-                eta = fmt_time(1.0 / (prob * total_rate)) if (total_rate > 0 and prob > 0) else "?"
-                gs, cpu_pct = get_hw_stats(now)
-                hw_parts = []
-                if gs is not None:
-                    u, p, t, _m = gs
-                    hw_parts.append("GPU{:.0f}% {:.0f}W {:.0f}°C".format(u, p, t))
-                if cpu_pct is not None:
-                    hw_parts.append("CPU{:.0f}%".format(cpu_pct))
-                hw_str = " | " + " ".join(hw_parts) if hw_parts else ""
-                main_part = "已跑{} | {}/秒 | 累计{} | 还需{} | 命中{}".format(
-                    fmt_time(cycle_elapsed),
-                    fmt_num(total_rate),
-                    fmt_num(gpu_total + cpu_total),
-                    eta,
-                    status_state["matches_found"],
-                )
-                verbose_part = "已跑{} | 速度{}/秒 (GPU{}+CPU{}) | 累计{} | 还需{} | 命中{}".format(
-                    fmt_time(cycle_elapsed),
-                    fmt_num(total_rate), fmt_num(g_rate), fmt_num(c_rate),
-                    fmt_num(gpu_total + cpu_total), eta,
-                    status_state["matches_found"],
-                )
-                cols = _term_cols()
-                budget = max(40, cols - 2)
-                for line in (verbose_part + hw_str, verbose_part, main_part + hw_str, main_part):
-                    if _display_width(line) <= budget:
-                        break
-                else:
-                    line = main_part
-                cur_w = _display_width(line)
-                pad = max(0, status_state["last_width"] - cur_w)
-                sys.stdout.write("\r" + line + (" " * pad) + "\r")
-                sys.stdout.flush()
-                status_state["last_width"] = cur_w
-            except BaseException:
-                time.sleep(1.0)
-    print("开始搜索...")
-    print()
-    def launch_stream(idx):
-        st = streams[idx]
-        state = stream_state[idx]
-        m_dev = matches_dev_list[idx]
-        c_dev = count_dev_list[idx]
-        m_host = matches_host_list[idx]
-        c_host = count_host_list[idx]
-        with st:
-            cp.cuda.runtime.memsetAsync(c_dev.data.ptr, 0, 4, st.ptr)
-            kernel(
-                (n_blocks,), (THREADS_PER_BLOCK,),
-                (state["cur_x"], state["cur_y"],
-                 np.int32(STEPS_PER_LAUNCH),
-                 np.uint64(state["step_offset"]),
-                 pp_dev,
-                 m_dev, c_dev,
-                 np.uint32(MAX_MATCHES)),
-                stream=st
-            )
-            cp.cuda.runtime.memcpyAsync(
-                c_host.ptr, c_dev.data.ptr, 4,
-                cp.cuda.runtime.memcpyDeviceToHost, st.ptr
-            )
-            cp.cuda.runtime.memcpyAsync(
-                m_host.ptr, m_dev.data.ptr,
-                MATCH_DTYPE.itemsize * MAX_MATCHES,
-                cp.cuda.runtime.memcpyDeviceToHost, st.ptr
-            )
-        state["step_offset"] += STEPS_PER_LAUNCH
-        in_flight[idx] = True
-    def collect_stream(idx):
-        nonlocal gpu_dropped_matches
-        streams[idx].synchronize()
-        in_flight[idx] = False
-        n_hits = int(count_host_np_list[idx][0])
-        if n_hits == 0:
-            return []
-        n_clamp = min(n_hits, MAX_MATCHES)
-        if n_hits > MAX_MATCHES:
-            gpu_dropped_matches += n_hits - MAX_MATCHES
-            sys.stderr.write(
-                "\n[警告] GPU 命中缓冲已满: 本批命中 {}, 保存 {}, 丢弃 {}. "
-                "请提高匹配难度或增大 MAX_MATCHES.\n".format(
-                    n_hits, MAX_MATCHES, n_hits - MAX_MATCHES)
-            )
-        arr = matches_host_np_list[idx][:n_clamp]
-        state = stream_state[idx]
-        base_keys = state["base_keys"]
-        results = []
-        for m in arr:
-            packed = int(m["thread_id"])
-            real_tid = packed >> 4
-            p_idx = packed & 0xF
-            step = int(m["step"])
-            addr_gpu = bytes(m["address"]).decode("ascii", errors="replace")
-            if real_tid >= n_threads or p_idx >= POINTS_PER_THREAD:
-                continue
-            priv_int = (base_keys[real_tid * POINTS_PER_THREAD + p_idx] + step) % SECP256K1_N
-            addr_cpu = cpu_priv_to_address(priv_int)
-            if addr_cpu != addr_gpu:
-                sys.stderr.write(
-                    "\n[警告] GPU/CPU 校验不一致, 丢弃: GPU={} CPU={}\n".format(addr_gpu, addr_cpu)
-                )
-                continue
-            results.append((priv_int.to_bytes(32, "big").hex(), addr_gpu, "GPU"))
-        return results
-    submit_order = []
-    status_thread = threading.Thread(target=status_loop, daemon=True)
-    status_thread.start()
-    interrupted = {"flag": False}
-    sig_names = ["SIGINT"]
-    if hasattr(signal, "SIGBREAK"):
-        sig_names.append("SIGBREAK")
-    prev_handlers = {}
-    for name in sig_names:
-        prev_handlers[name] = signal.getsignal(getattr(signal, name))
-    def _on_sig(signum, frame):
-        if not interrupted["flag"]:
-            interrupted["flag"] = True
-        else:
-            for n in sig_names:
-                signal.signal(getattr(signal, n), prev_handlers[n])
-            raise KeyboardInterrupt
-    for name in sig_names:
-        signal.signal(getattr(signal, name), _on_sig)
+            index.rollback()
+            raise
+        metrics["saved"] += saved
+        metrics["classified"] += len(raw)
+        pending.popleft()
+
+    def enqueue(arr, idx, steps):
+        nonlocal unsubmitted
+        metrics["addresses"] += n_threads*points*steps
+        metrics["candidates"] += len(arr)
+        raw = candidates_from(arr, idx)
+        unsubmitted = raw
+        # Bounded batches and queue: normal classification overlaps both GPU streams.
+        for start in range(0, len(raw), 128):
+            while len(pending) >= workers*2:
+                if not pending[0][0].done():
+                    warn("CPU 分类队列已满，暂缓提交以保留全部候选。")
+                before = time.monotonic()
+                finish_one()
+                metrics["backpressure_seconds"] += time.monotonic()-before
+            batch = raw[start:start+128]
+            pending.append((pool.submit(classify_batch, batch, config), batch))
+            unsubmitted = raw[start+128:]
+
+    print("开始搜索；Ctrl+C 或到时后停止提交，排空在途候选再退出。")
     try:
-        for s in range(N_STREAMS):
-            launch_stream(s)
-            submit_order.append(s)
-        while not interrupted["flag"]:
-            idx = submit_order.pop(0)
-            gpu_matches_raw = collect_stream(idx)
-            if interrupted["flag"]:
-                sys.stdout.write("\n[收到中断, 正在清理...]\n")
-                sys.stdout.flush()
-                break
-            launch_stream(idx)
-            submit_order.append(idx)
-            gpu_total += BATCH
-            session_gpu_total += BATCH
-            cpu_added = drain_cpu_stats()
-            session_cpu_total += cpu_added
-            cpu_matches_raw_pairs = drain_cpu_matches()
-            cpu_matches_raw = [(h, a, "CPU") for (h, a) in cpu_matches_raw_pairs]
-            all_matches = gpu_matches_raw + cpu_matches_raw
-            if not all_matches:
-                continue
-            save_matches(all_matches)
-            matches_found += len(all_matches)
-            session_matches_found += len(all_matches)
-            status_state["matches_found"] = matches_found
-            if matches_found < HIT_PAUSE_THRESHOLD:
-                continue
-            pause_evt.set()
-            status_paused.set()
-            sys.stdout.write("\r" + (" " * status_state["last_width"]) + "\r")
-            status_state["last_width"] = 0
-            sys.stdout.flush()
-            print()
-            print("=" * 70)
-            print("  *** 已累计找到 {} 个匹配地址 ***".format(matches_found))
-            print("=" * 70)
-            print("  匹配模式     : {}".format(pattern_desc))
-            print("  本轮用时     : {}".format(fmt_time(time.time() - cycle_start)))
-            print("  已保存到     : {}".format(output_path))
-            print("  (所有命中含私钥已写入文件, 请妥善保管)")
-            print("=" * 70)
-            print()
-            print("  请选择操作:")
-            print("    1) 继续生成")
-            print("    2) 停止生成")
-            print("    3) 更改生成条件 (重新输入模式)")
-            print()
-            ans = input_with_timeout("  输入选项 [1/2/3] (30 秒无回应自动继续): ", 30.0)
-            choice = (ans or "").strip()
-            if choice == "2" or choice.lower() in ("n", "no", "否", "不", "stop"):
-                print("\n已停止。")
-                return
-            if choice == "3":
-                print()
-                print("-" * 70)
-                print("  更改生成条件")
-                print("-" * 70)
-                while True:
-                    mode = input("  选择模式 [1=自定义前后缀 / 2=尾部重复]: ").strip()
-                    if mode in ("1", "2"): break
-                    print("  无效输入")
-                new_prefix, new_suffix, new_repeat = "", "", 0
-                if mode == "1":
-                    new_prefix, new_suffix = prompt_mode_1()
-                else:
-                    new_repeat = prompt_mode_2()
-                prefix, suffix, repeat_tail = new_prefix, new_suffix, new_repeat
-                pp[:] = 0
-                pp["prefix_len"] = len(prefix)
-                pp["suffix_len"] = len(suffix)
-                pp["repeat_n"] = repeat_tail
-                if prefix: pp["prefix"][0, :len(prefix)] = np.frombuffer(prefix.encode(), dtype=np.uint8)
-                if suffix: pp["suffix"][0, :len(suffix)] = np.frombuffer(suffix.encode(), dtype=np.uint8)
-                for s_idx in range(N_STREAMS):
-                    if in_flight[s_idx]:
-                        try:
-                            streams[s_idx].synchronize()
-                            in_flight[s_idx] = False
-                        except BaseException: pass
-                submit_order[:] = []
-                pp_dev.set(pp)
-                parts = []
-                if prefix:      parts.append("前缀={}".format(prefix))
-                if suffix:      parts.append("后缀={}".format(suffix))
-                if repeat_tail: parts.append("尾部重复≥{}位".format(repeat_tail))
-                pattern_desc = " 且 ".join(parts)
-                prob = estimate_probability(prefix, suffix, repeat_tail)
-                stop_evt.set()
-                for p in cpu_procs:
-                    try: p.kill()
-                    except BaseException: pass
-                for p in cpu_procs:
-                    try: p.join(timeout=0.2)
-                    except BaseException: pass
-                cpu_procs[:] = []
-                old_cpu_added = drain_cpu_stats()
-                session_cpu_total += old_cpu_added
-                drain_cpu_matches()
-                stop_evt = ctx.Event()
-                for _ in range(n_cpu_workers):
-                    cpw = ctx.Process(target=cpu_worker,
-                                      args=(prefix, suffix, repeat_tail,
-                                            match_q, stat_q, stop_evt, pause_evt),
-                                      daemon=True)
-                    cpw.start()
-                    cpu_procs.append(cpw)
-                print()
-                print("新模式已应用: {}".format(pattern_desc))
-                if prob > 0:
-                    print("理论概率: 平均 {} 个地址出 1 个".format(fmt_num(1/prob)))
-                print()
-            else:
-                if ans is None:
-                    print("  (30 秒无回应, 自动继续)")
-            print()
-            print("继续搜索...")
-            print()
-            matches_found = 0
-            status_state["matches_found"] = 0
-            cycle_start = time.time()
-            gpu_total = 0
-            cpu_total = 0
-            leftover_cpu = drain_cpu_stats()
-            session_cpu_total += leftover_cpu
-            drain_cpu_matches()
-            pause_evt.clear()
-            status_paused.clear()
-            if not submit_order:
-                for s in range(N_STREAMS):
-                    launch_stream(s)
-                    submit_order.append(s)
-    except KeyboardInterrupt:
-        print("\n\n用户中断。")
+        for idx in range(len(streams)):
+            launch(idx, launch_steps)
+            order.append(idx)
+        while order:
+            idx = order.popleft()
+            # Normal case yields one batch. Replay batches are submitted as
+            # they finish, bounding memory even under a dense filter.
+            batches = collect(idx)
+            for arr, steps in batches:
+                enqueue(arr, idx, steps)
+            if not interrupted.is_set() and time.monotonic() < deadline:
+                launch(idx, launch_steps)
+                order.append(idx)
+            while pending and pending[0][0].done():
+                finish_one()
+        while pending:
+            finish_one()
+    except Exception as exc:
+        error = exc
+        # Retain unclassified private-key/address pairs for recovery, never print keys.
+        recovery = output_path + ".pending.jsonl"
+        with open(recovery, "a", encoding="utf-8") as f:
+            for _, raw in pending:
+                for key, address in raw:
+                    f.write(json.dumps({"private_key": key, "address": address, "config": config})+"\n")
+            for key, address in unsubmitted:
+                f.write(json.dumps({"private_key": key, "address": address, "config": config})+"\n")
+            for arr, _ in batches:
+                for key, address in candidates_from(arr, idx):
+                    f.write(json.dumps({"private_key": key, "address": address, "config": config})+"\n")
+            for idx in order:
+                for arr, _ in collect(idx):
+                    for key, address in candidates_from(arr, idx):
+                        f.write(json.dumps({"private_key": key, "address": address, "config": config})+"\n")
+        print("\n处理失败，待验证候选已保存到 {}".format(recovery))
     finally:
-        for name in sig_names:
-            try: signal.signal(getattr(signal, name), prev_handlers[name])
-            except BaseException: pass
-        for p in cpu_procs:
-            if p.is_alive():
-                try: p.kill()
-                except BaseException: pass
-        for p in cpu_procs:
-            try: p.join(timeout=0.2)
-            except BaseException: pass
-        status_stop.set()
-        try: status_thread.join(timeout=0.5)
-        except BaseException: pass
-        for s in range(N_STREAMS):
-            if in_flight[s]:
-                try: streams[s].synchronize()
-                except BaseException: pass
-        elapsed = time.time() - session_start
-        print()
-        print("=" * 70)
-        print("  会话总结")
-        print("=" * 70)
-        print("  总用时       : {}".format(fmt_time(elapsed)))
-        print("  GPU 生成     : {} 个地址".format(fmt_num(session_gpu_total)))
-        print("  CPU 生成     : {} 个地址".format(fmt_num(session_cpu_total)))
-        print("  总共生成     : {} 个地址".format(fmt_num(session_gpu_total + session_cpu_total)))
-        print("  找到匹配     : {} 个".format(session_matches_found))
-        if gpu_dropped_matches or cpu_dropped_matches:
-            print("  丢弃命中     : GPU {} 个, CPU {} 个".format(
-                fmt_num(gpu_dropped_matches), fmt_num(cpu_dropped_matches)))
-        if elapsed > 0:
-            print("  平均速度     : {} 个地址/秒".format(
-                fmt_num((session_gpu_total + session_cpu_total) / elapsed)))
-        print("=" * 70)
+        pool.shutdown(wait=True)
+        display_stop.set()
+        display.join()
+        for stream in streams:
+            stream.synchronize()
+        output.close()
+        index.close()
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+        elapsed = time.monotonic()-started
+        for column, label in ((0, "gpu_utilization_percent"), (1, "cpu_system_percent")):
+            metrics[label] = hardware_totals[column]/hardware_counts[column] if hardware_counts[column] else None
+        metrics.update(elapsed_seconds=elapsed, addresses_per_second=metrics["addresses"]/max(elapsed, .001),
+                       candidates_per_second=metrics["candidates"]/max(elapsed, .001),
+                       points_per_thread=points, initial_steps=initial_steps, final_steps=launch_steps,
+                       complete=error is None, config=config)
+        with open(output_path + ".stats.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+        print("\n生成 {}，候选 {}，已分类 {}，保存 {}，溢出重放 {} 次。".format(
+            metrics["addresses"], metrics["candidates"], metrics["classified"],
+            metrics["saved"], metrics["overflow_replays"]))
+    if error:
+        raise error
+    return metrics
+
+
 def prompt_mode_1():
     while True:
-        prefix = input("请输入自定义前缀 (留空表示无, 必须以 T 开头): ").strip()
-        suffix = input("请输入自定义后缀 (留空表示无): ").strip()
+        prefix = input("请输入前缀列表 (逗号分隔, 留空表示无, 必须以 T 开头): ").strip()
+        suffix = input("请输入后缀列表 (逗号分隔, 留空表示无): ").strip()
         if not prefix and not suffix:
             print("错误: 前缀和后缀至少填写一项。\n")
             continue
-        errs = validate_pattern(prefix, suffix)
-        if errs:
-            print("输入有误:")
-            for e in errs: print("  - {}".format(e))
-            print()
+        combine = input("前缀/后缀组合 [AND/OR，默认 AND]: ").strip().upper() or "AND"
+        if combine not in ("AND", "OR"):
+            print("请输入 AND 或 OR。")
             continue
-        return prefix, suffix
+        errs = validate_pattern(prefix, suffix, combine == "OR")
+        if errs:
+            print("输入有误: " + "; ".join(errs))
+            continue
+        return {"mode": "exact", "prefix": prefix, "suffix": suffix,
+                "combine_or": combine == "OR"}
+
 def prompt_mode_2():
     while True:
-        s = input("请输入尾号重复字符数 N (地址末尾 N 位为相同字符, 建议 5-8): ").strip()
-        try: n = int(s)
+        s = input("靓号长度范围 [默认 8-34；单值 8 表示 8-8]: ").strip() or "8-34"
+        try:
+            if "-" in s:
+                a, b = [int(x.strip()) for x in s.split("-", 1)]
+            else:
+                a = b = int(s)
         except ValueError:
-            print("错误: 请输入整数。\n"); continue
-        if n < 5:
-            print("错误: N 太小会产生海量命中并拖慢程序, 请至少输入 5。\n"); continue
-        if n > 34:
-            print("错误: 太大, 地址只有 34 位。\n"); continue
-        return n
+            print("错误: 请输入整数或 min-max。\n"); continue
+        if a < 2 or b < a or b > 34:
+            print("错误: 长度必须满足 2 <= 最小值 <= 最大值 <= 34。\n"); continue
+        rules = {}
+        for key, label in (("same", "连续相同字符"), ("folded", "同字母忽略大小写"),
+                           ("groups", "连续分组（含顺序分组）"),
+                           ("straight", "数字顺子"), ("periodic", "周期重复"),
+                           ("palindrome", "回文/对称")):
+            ans = input("开启{}? [Y/n]: ".format(label)).strip().lower()
+            rules[key] = ans not in ("n", "no", "否", "0")
+        if not any(rules.values()):
+            print("至少开启一种规则。")
+            continue
+        if a < 8:
+            print("提示: 小于 8 位可能产生大量候选；过载将报警并减速，不会自动提高长度。")
+        return {"mode": "wide", "min_len": a, "max_len": b, "rules": rules}
 def main():
     print("=" * 70)
     print("  TRON 靓号地址生成器 (CUDA + CPU 全速版)")
     print("=" * 70)
     print()
-    print("  模式 1: 自定义模式 — 指定前缀和/或后缀")
-    print("  模式 2: 靓号模式   — 指定尾部重复字符位数")
+    print("  模式 1: 前缀/后缀模式 — 支持多个目标和 AND/OR")
+    print("  模式 2: 靓号模式     — 全地址宽筛 + CPU 分类")
     print()
     while True:
         mode = input("请选择模式 [1/2]: ").strip()
         if mode in ("1", "2"): break
         print("无效输入。\n")
-    prefix = ""; suffix = ""; repeat_tail = 0
     if mode == "1":
-        prefix, suffix = prompt_mode_1()
+        config = prompt_mode_1()
     else:
-        repeat_tail = prompt_mode_2()
+        config = prompt_mode_2()
+    while True:
+        raw_minutes = input("运行时间（分钟，0=一直运行）: ").strip() or "0"
+        try:
+            duration_minutes = float(raw_minutes)
+            if math.isfinite(duration_minutes) and duration_minutes >= 0: break
+        except ValueError:
+            pass
+        print("请输入不小于 0 的数字。")
     out_dir = os.path.join(APP_BASE_DIR, "命中地址")
 
     try:
@@ -967,9 +782,9 @@ def main():
             "  请检查脚本所在目录是否有写权限\n".format(out_dir, e))
         sys.exit(1)
     output_path = os.path.join(
-        out_dir, "matches_{}.txt".format(datetime.now().strftime("%Y%m%d_%H%M%S"))
+        out_dir, "matches_{}.jsonl".format(datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     )
-    run_search(prefix, suffix, repeat_tail, output_path)
+    run_search(config, output_path, duration_minutes)
 if __name__ == "__main__":
     mp.freeze_support()
     main()

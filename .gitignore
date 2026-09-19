@@ -4,3 +4,6 @@ __pycache__/
 命中地址/
 .vscode/
 .idea/
+
+.venv/
+/benchmark_results.json

@@ -577,13 +577,18 @@ __device__ void base58_encode_25(char out[34], const u8 in[25]) {
 }
 
 struct PatternParams {
-    int prefix_len;
-    int suffix_len;
-    int repeat_n;
-    char prefix[40];
-    char suffix[40];
+    int mode;             // 0=exact prefix/suffix, 1=full-address wide screen
+    int combine_or;       // exact mode: 0=AND, 1=OR
+    int prefix_count;
+    int suffix_count;
+    int min_len;
+    int max_len;
+    int rules;
+    int prefix_len[8];
+    int suffix_len[8];
+    char prefixes[8][40];
+    char suffixes[8][40];
 };
-
 struct MatchRecord {
     u32  thread_id;
     u32  _pad;
@@ -591,6 +596,75 @@ struct MatchRecord {
     char address[34];
     char _pad2[6];
 };
+
+__device__ __forceinline__ char lower58(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+}
+
+// Necessary structural checks only; CPU records full matches and metadata.
+// Same/group/period matches have a qualifying short witness. A longer
+// palindrome contains a central palindrome of length min_len or min_len+1.
+__device__ bool wide_candidate(const char addr[34], int min_len, int max_len, int rules) {
+    char text[34];
+    for (int i = 0; i < 34; ++i) text[i] = lower58(addr[i]);
+    int exact = 1, folded = 1, block_span = 0, run = 1;
+    int up = 1, down = 1, digits_up = 1, digits_down = 1;
+    for (int i = 1; i < 34; ++i) {
+        char a = text[i-1], b = text[i];
+        exact = addr[i] == addr[i-1] ? exact+1 : 1;
+        folded = a == b ? folded+1 : 1;
+        if ((rules & 1) && exact >= min_len) return true;
+        if ((rules & 2) && b >= 'a' && b <= 'z' && folded >= min_len) return true;
+        if (a == b) ++run;
+        else {
+            block_span = run >= 2 ? block_span+run : 0;
+            run = 1;
+        }
+        if ((rules & 4) && run >= 2 && block_span+run >= min_len) return true;
+        bool family = (a >= 'a' && a <= 'z' && b >= 'a' && b <= 'z') ||
+                      (a >= '1' && a <= '9' && b >= '1' && b <= '9');
+        up = family && (b == a || b == a+1) ? up+1 : 1;
+        down = family && (b == a || b == a-1) ? down+1 : 1;
+        if ((rules & 4) && (up >= min_len || down >= min_len)) return true;
+        digits_up = a >= '1' && a <= '8' && b == a+1 ? digits_up+1 : 1;
+        digits_down = a >= '2' && a <= '9' && b == a-1 ? digits_down+1 : 1;
+        if ((rules & 8) && (digits_up >= min_len || digits_down >= min_len)) return true;
+    }
+    if (rules & 16) {
+        for (int period = 2; period <= 4; ++period) {
+            int required = min_len > 2*period ? min_len : 2*period;
+            if (required > max_len) continue;
+            int span = period;
+            for (int i = period; i < 34; ++i) {
+                span = text[i] == text[i-period] ? span+1 : period;
+                if (span >= required) return true;
+            }
+        }
+    }
+    if (rules & 32) {
+        for (int length = min_len; length <= min_len+1 && length <= max_len; ++length) {
+            for (int start = 0; start+length <= 34; ++start) {
+                bool palindrome = true;
+                for (int j = 0; j < length/2; ++j) {
+                    if (text[start+j] != text[start+length-1-j]) { palindrome = false; break; }
+                }
+                if (palindrome) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Test entry point executes the actual coarse predicate on supplied addresses.
+extern "C" __global__ void screen_addresses(const char *addresses, int count,
+    const PatternParams *params, unsigned char *hits) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) hits[i] = wide_candidate(addresses+34*i, params->min_len, params->max_len, params->rules);
+}
+
+#ifndef SEARCH_MODE
+#define SEARCH_MODE -1
+#endif
 
 extern "C" __global__ void vanity_kernel(
     u64       *cur_x,
@@ -602,7 +676,7 @@ extern "C" __global__ void vanity_kernel(
     u32        *out_count,
     u32         max_matches
 ) {
-    PatternParams params = *params_in;
+    const PatternParams &params = *params_in;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     u64 px[POINTS_PER_THREAD][4], py[POINTS_PER_THREAD][4];
@@ -656,54 +730,53 @@ extern "C" __global__ void vanity_kernel(
             for (int i = 0; i < 21; i++) raw[i] = payload[i];
             raw[21] = h2[0]; raw[22] = h2[1]; raw[23] = h2[2]; raw[24] = h2[3];
 
-            int sfx_len = params.suffix_len;
-            int pfx_len = params.prefix_len;
-            int rep_n = params.repeat_n;
-            if (sfx_len < 0 || sfx_len > 34) sfx_len = 0;
-            if (pfx_len < 0 || pfx_len > 34) pfx_len = 0;
-            if (rep_n < 0 || rep_n > 34) rep_n = 0;
-
-            int tail_k = sfx_len > rep_n ? sfx_len : rep_n;
-            bool ok = true;
-
-            if (tail_k > 0) {
-
-                char tail_chars[34];
-                base58_tail(tail_chars, raw, tail_k);
-
-                if (sfx_len > 0) {
-                    for (int i = 0; i < sfx_len; i++) {
-
-                        if (tail_chars[sfx_len - 1 - i] != params.suffix[i]) {
-                            ok = false; break;
-                        }
-                    }
-                }
-
-                if (ok && rep_n > 0) {
-                    char c0 = tail_chars[0];
-                    for (int i = 1; i < rep_n; i++) {
-                        if (tail_chars[i] != c0) { ok = false; break; }
-                    }
-                }
-            }
-
-            if (!ok) continue;
-
+            bool ok = false;
             char addr[34];
-            base58_encode_25(addr, raw);
-
-            if (pfx_len > 0) {
-                for (int i = 0; i < pfx_len; i++) {
-                    if (addr[i] != params.prefix[i]) { ok = false; break; }
+            if (SEARCH_MODE == 1 || (SEARCH_MODE == -1 && params.mode == 1)) {
+                // Full-address path is intentionally isolated from the exact
+                // tail path.  It is broader, and CPU performs final rules.
+                base58_encode_25(addr, raw);
+                ok = wide_candidate(addr, params.min_len, params.max_len, params.rules);
+            } else {
+                int max_suffix = 0;
+                for (int si = 0; si < params.suffix_count && si < 8; si++) {
+                    if (params.suffix_len[si] > max_suffix) max_suffix = params.suffix_len[si];
                 }
+                char tail_chars[34];
+                if (max_suffix > 0) base58_tail(tail_chars, raw, max_suffix);
+                bool suffix_ok = (params.suffix_count == 0);
+                for (int si = 0; si < params.suffix_count; si++) {
+                    bool one = true;
+                    int sl = params.suffix_len[si];
+                    for (int i = 0; i < sl; i++) {
+                        if (tail_chars[sl-1-i] != params.suffixes[si][i]) { one = false; break; }
+                    }
+                    if (one) { suffix_ok = true; break; }
+                }
+                // Reject before full Base58 in suffix-only and AND searches.
+                if (!suffix_ok && (!params.combine_or || params.prefix_count == 0)) continue;
+                base58_encode_25(addr, raw);
+                bool prefix_ok = (params.prefix_count == 0);
+                if (!(params.combine_or && params.suffix_count > 0 && suffix_ok)) {
+                    for (int pi = 0; pi < params.prefix_count; pi++) {
+                        bool one = true;
+                        for (int i = 0; i < params.prefix_len[pi]; i++) {
+                            if (addr[i] != params.prefixes[pi][i]) { one = false; break; }
+                        }
+                        if (one) { prefix_ok = true; break; }
+                    }
+                }
+                ok = params.combine_or
+                    ? ((params.prefix_count > 0 && prefix_ok) || (params.suffix_count > 0 && suffix_ok))
+                    : (prefix_ok && suffix_ok);
+
             }
 
             if (ok) {
                 u32 idx = atomicAdd(out_count, 1u);
                 if (idx < max_matches) {
 
-                    out[idx].thread_id = ((u32)tid << 4) | ((u32)p & 0xF);
+                    out[idx].thread_id = (u32)(tid * POINTS_PER_THREAD + p);
                     out[idx].step = step_offset + (u64)step;
                     #pragma unroll
                     for (int i = 0; i < 34; i++) out[idx].address[i] = addr[i];
