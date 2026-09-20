@@ -106,7 +106,10 @@ def verify_filtered_search(m, threads, steps, sx, sy, all_matches):
              dict(mode="exact", prefix=first[:5], suffix=last[-6:], combine_or=True),
              dict(mode="exact", suffix=first[-6:], combine_or=True),
              dict(mode="exact", prefix=first[:5], combine_or=True),
-             dict(mode="wide", min_len=2, max_len=8)]
+             dict(mode="wide", min_len=2, max_len=8),
+             dict(mode="wide", rule_minima={"same": 3, "folded": 4, "groups": 4, "digits": 2}),
+             dict(mode="wide", rule_minima={"cyclic": 2, "digit_periodic": 4, "mixed_periodic": 4,
+                                          "digit_palindrome": 3, "mixed_palindrome": 3})]
     kernels = {mode: load_kernel(points_per_thread=m, mode=mode) for mode in ("exact", "wide")}
     for cfg in cases:
         x, y = cp.asarray(sx), cp.asarray(sy)
@@ -152,6 +155,19 @@ def verify_screen():
                 assert not classify_vanity(address, cfg) or hit, (cfg, address)
                 comparisons += 1
     print("✓ 实际 CUDA 粗筛/CPU 分类对照: {} 项无漏筛".format(comparisons))
+    from test_independent_rules import independent_cases
+    addresses, configs = independent_cases()
+    encoded = cp.asarray(np.frombuffer("".join(addresses).encode(), dtype=np.uint8))
+    output = cp.zeros(len(addresses), dtype=cp.uint8)
+    comparisons = 0
+    for cfg in configs:
+        params = cp.asarray(make_pattern_params(cfg))
+        kernel(((len(addresses)+127)//128,), (128,),
+               (encoded, np.int32(len(addresses)), params, output))
+        for address, hit in zip(addresses, output.get()):
+            assert not classify_vanity(address, cfg) or hit, (cfg, address)
+            comparisons += 1
+    print("✓ 独立长度 CUDA 粗筛/CPU 分类对照: {} 项无漏筛".format(comparisons))
 
 
 def verify_host_screen():
@@ -163,9 +179,10 @@ def verify_host_screen():
     from test_vanity import fixtures
     from cpu_worker import classify_vanity, RULE_BITS, rule_mask
     source = Path(KERNEL_PATH).read_text(encoding="utf-8")
-    source = source[source.index("__device__ __forceinline__ char lower58"):source.index("// Test entry point")]
+    source = 'typedef unsigned int u32; typedef unsigned long long u64;\n' + source[source.index("struct PatternParams"):source.index("// Test entry point")]
     source = source.replace("__device__", "").replace("__forceinline__", "inline")
     source += '\nextern "C" __declspec(dllexport) int host_screen(const char *a, int lo, int hi, int mask) { return wide_candidate(a,lo,hi,mask); }\n'
+    source += '\nextern "C" __declspec(dllexport) int host_independent(const char *a, const int *lo) { return independent_candidate(a,lo); }\n'
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory)/"screen.cpp"
         path.write_text(source, encoding="utf-8")
@@ -191,6 +208,20 @@ def verify_host_screen():
                     assert not classify_vanity(address, config) or hit, (config, address)
                     comparisons += 1
         print("Host execution of actual coarse predicate: {} comparisons, no false negatives (not GPU execution).".format(comparisons))
+        from test_independent_rules import independent_cases
+        from cpu_worker import RULE_SPECS
+        addresses, configs = independent_cases()
+        fn = lib.host_independent
+        fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+        fn.restype = ctypes.c_int
+        comparisons = 0
+        for config in configs:
+            thresholds = (ctypes.c_int*10)(*[config['rule_minima'].get(s[0], 0) for s in RULE_SPECS])
+            for address in addresses:
+                hit = fn(address.encode(), thresholds)
+                assert not classify_vanity(address, config) or hit, (config, address)
+                comparisons += 1
+        print("Independent thresholds: {} comparisons, no false negatives (host execution).".format(comparisons))
         # Windows holds loaded DLLs open until FreeLibrary.
         import _ctypes
         _ctypes.FreeLibrary(lib._handle)

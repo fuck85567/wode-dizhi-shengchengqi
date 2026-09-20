@@ -11,6 +11,19 @@ from Crypto.Hash import keccak as keccak_lib
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 RULE_BITS = {"same": 1, "folded": 2, "groups": 4, "straight": 8,
              "periodic": 16, "palindrome": 32}
+# Order is the shared Python/CUDA rule_minima[10] ABI. Zero disables a rule.
+RULE_SPECS = (
+    ("same", "纯豹子，区分大小写", 34, "88888888、AAAAAAAA", "8位约4分钟；9位约4小时", 8),
+    ("folded", "同字母，忽略大小写", 34, "aAaAAAaaAa", "10位约30～35分钟；11位约16小时", 10),
+    ("groups", "连续分组", 34, "aabbccdd、aaabbbbcccc、11122233", "18位约1小时（粗估）", 8),
+    ("straight", "普通数字顺子", 9, "123456789、98765432", "8位约50分钟；9位约4.4天", 8),
+    ("cyclic", "数字循环顺子", 34, "789123456、123456789123", "8位约12分钟；9位约12小时", 8),
+    ("digit_periodic", "数字周期重复", 34, "123123123、12121212", "10位约1.8小时", 10),
+    ("mixed_periodic", "含字母周期重复，忽略大小写", 34, "ABCDABCDABCD", "13位约1小时", 13),
+    ("digit_palindrome", "纯数字回文", 34, "1234554321", "10位约11～13分钟", 10),
+    ("mixed_palindrome", "含字母回文，忽略大小写", 34, "ABCDEFGGFEDCBA", "18位约50～60分钟", 18),
+    ("digits", "任意连续纯数字", 34, "5837291648357291", "16位约25分钟", 16),
+)
 SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
@@ -36,6 +49,17 @@ def validate_config(config):
     if config.get("mode") not in ("wide", "exact"):
         raise ValueError("模式必须为 wide 或 exact")
     if config["mode"] == "wide":
+        if "rule_minima" in config:
+            minima = config["rule_minima"]
+            if not isinstance(minima, dict) or set(minima)-{s[0] for s in RULE_SPECS}:
+                raise ValueError("规则配置包含未知规则")
+            for key, label, maximum, *_ in RULE_SPECS:
+                value = minima.get(key, 0)
+                if type(value) is not int or (value != 0 and not 2 <= value <= maximum):
+                    raise ValueError("{} 最低长度必须为 2～{}，0 表示关闭".format(label, maximum))
+            if not any(minima.values()):
+                raise ValueError("至少开启一种规则")
+            return config
         lo, hi = config.get("min_len", 8), config.get("max_len", 34)
         if not isinstance(lo, int) or not isinstance(hi, int) or not 2 <= lo <= hi <= 34:
             raise ValueError("长度范围必须满足 2 <= 最小值 <= 最大值 <= 34（默认 8-34）")
@@ -84,7 +108,9 @@ def _summary(matches):
     if not matches:
         return None
     priority = {"连续相同字符": 0, "同字母忽略大小写": 1, "连续分组": 2,
-                "数字顺子": 3, "周期重复": 4, "回文": 5, "前缀": 6, "后缀": 7}
+                "数字顺子": 3, "周期重复": 4, "回文": 5, "前缀": 6, "后缀": 7,
+                "数字循环顺子": 8, "数字周期重复": 9, "含字母周期重复": 10,
+                "纯数字回文": 11, "含字母回文": 12, "连续纯数字": 13}
     matches.sort(key=lambda m: (-m["length"], priority[m["type"]], m["start"]))
     # Keep independent locations and types, suppress shorter contained copies.
     kept = []
@@ -115,6 +141,8 @@ def classify_vanity(address, config):
     """
     if len(address) != 34 or not address.startswith("T") or any(c not in BASE58_ALPHABET for c in address):
         return None
+    if config.get("mode") == "wide" and "rule_minima" in config:
+        return classify_independent(address, config["rule_minima"])
     if config.get("mode") == "exact":
         prefixes, suffixes = split_targets(config.get("prefix", "")), split_targets(config.get("suffix", ""))
         ps = [p for p in prefixes if address.startswith(p)]
@@ -219,6 +247,81 @@ def classify_vanity(address, config):
     return _summary(matches)
 
 
+def classify_independent(address, minima):
+    """Independent lower bounds, upper bound 34 (ordinary straights <=9)."""
+    matches = []
+    enabled = {key: minima.get(key, 0) for key in ("same", "folded", "groups", "straight")}
+    if any(enabled.values()):
+        legacy = classify_vanity(address, dict(mode="wide", min_len=min(v for v in enabled.values() if v),
+                    max_len=34, rules={key: bool(enabled.get(key)) for key in RULE_BITS}))
+        if legacy:
+            types = dict(zip(("连续相同字符", "同字母忽略大小写", "连续分组", "数字顺子"), enabled))
+            for match in legacy["matches"]:
+                key = types[match["type"]]
+                if match["length"] >= enabled[key]:
+                    matches.append(dict(match, rule=key, minimum_length=enabled[key]))
+    text = address.lower()
+    digit_end = list(range(34))
+    for i in range(33, -1, -1):
+        if '1' <= text[i] <= '9':
+            digit_end[i] = digit_end[i+1] if i < 33 else 34
+    def add(key, start, length, kind, tags=None):
+        match = _match(address, start, length, kind, tags=tags)
+        match.update(rule=key, minimum_length=minima[key])
+        matches.append(match)
+    lo = minima.get("digits", 0)
+    if lo:
+        for start in range(35-lo):
+            if digit_end[start]-start >= lo:
+                add("digits", start, digit_end[start]-start, "连续纯数字")
+    lo = minima.get("cyclic", 0)
+    if lo:
+        for start in range(35-lo):
+            for delta in (1, -1):
+                end = start+1
+                while end < digit_end[start] and (int(text[end])-int(text[end-1])) % 9 == delta % 9:
+                    end += 1
+                if end-start >= lo:
+                    add("cyclic", start, end-start, "数字循环顺子", ["循环递增" if delta == 1 else "循环递减"])
+    for key, kind, digits_only in (("digit_periodic", "数字周期重复", True),
+                                    ("mixed_periodic", "含字母周期重复", False)):
+        lo = minima.get(key, 0)
+        if not lo:
+            continue
+        best, periods = [0]*34, [0]*34
+        for period in (2, 3, 4):
+            repeated = 0
+            for start in range(33-period, -1, -1):
+                repeated = repeated+1 if text[start] == text[start+period] else 0
+                length = repeated+period
+                if digits_only:
+                    length = min(length, digit_end[start]-start)
+                if length < max(lo, 2*period) or length <= best[start]:
+                    continue
+                part = text[start:start+length]
+                if part.count(part[0]) == length or (not digits_only and not any(c.isalpha() for c in part)):
+                    continue
+                best[start], periods[start] = length, period
+        for start, length in enumerate(best):
+            if length:
+                add(key, start, length, kind, ["周期{}位".format(periods[start])])
+    for key, kind, digits_only in (("digit_palindrome", "纯数字回文", True),
+                                    ("mixed_palindrome", "含字母回文", False)):
+        lo = minima.get(key, 0)
+        if not lo:
+            continue
+        for center in range(67):
+            left, right = center//2, (center+1)//2
+            while (left >= 0 and right < 34 and text[left] == text[right] and
+                   (not digits_only or '1' <= text[left] <= '9')):
+                left -= 1
+                right += 1
+            length = right-left-1
+            if length >= lo and (digits_only or any(c.isalpha() for c in text[left+1:right])):
+                add(key, left+1, length, kind)
+    return _summary(matches)
+
+
 def classify_and_verify(priv_hex, gpu_address, config):
     address = _priv_to_address(bytes.fromhex(priv_hex))
     if address != gpu_address:
@@ -228,6 +331,8 @@ def classify_and_verify(priv_hex, gpu_address, config):
         result.update(private_key=priv_hex, address=address, source="GPU",
                       verified_by="CPU", classified_by="CPU",
                       time=datetime.now(timezone.utc).isoformat(), schema_version=1)
+        if "rule_minima" in config:
+            result.update(rule_minima=dict(config["rule_minima"]), schema_version=2)
     return result
 
 

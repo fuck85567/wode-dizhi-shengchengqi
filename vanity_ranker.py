@@ -22,14 +22,15 @@ KEY_FIELDS = ("private_key", "privkey", "私钥")
 SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 DIMENSIONS = ("有意义长度", "视觉一致性", "结构规整", "位置", "个人偏好")
 SERIES = ("纯豹子", "同字母混合大小写", "成对分组", "等长多连分组",
-          "阶梯分组", "对称分组", "变长分组", "顺序分组", "数字顺子", "周期重复", "回文对称")
+          "阶梯分组", "对称分组", "变长分组", "顺序分组", "数字顺子", "数字循环顺子",
+          "数字周期重复", "含字母周期重复", "纯数字回文", "含字母回文", "连续纯数字")
 DEFAULT_CONFIG = {
     "权重": dict(zip(DIMENSIONS, (35, 25, 25, 10, 5))),
     "位置系数": {"尾部": 1.0, "开头": 0.8, "中间": 0.5},
     "偏好字符": "",
     "偏好系列": [],
 }
-SCORING_VERSION = 1
+SCORING_VERSION = 2
 
 
 def load_config(path=None):
@@ -140,13 +141,19 @@ def find_matches(address, minimum=8, maximum=34):
                 for period in range(2, min(4, length//2)+1):
                     if folded[period:] == folded[:-period]:
                         complete = length % period == 0
-                        kinds.append(("周期重复", .8+.12*complete+.08*(2/period), [],
+                        kinds.append(("数字周期重复" if folded.isdigit() else "含字母周期重复", .8+.12*complete+.08*(2/period), [],
                                       ["周期{}位".format(period), "完整周期" if complete else "末尾不足一周期"]))
                         break
             if length <= 9 and (folded in "123456789" or folded in "987654321"):
                 kinds.append(("数字顺子", 1.0, [], ["递增" if folded[0] < folded[-1] else "递减"]))
+            if folded.isdigit():
+                # Digits alone are meaningful length, not a perfect structure.
+                kinds.append(("连续纯数字", .3, [], ["纯数字；不要求排列规律"]))
+                deltas = [(int(b)-int(a)) % 9 for a, b in zip(folded, folded[1:])]
+                if all(d == 1 for d in deltas) or all(d == 8 for d in deltas):
+                    kinds.append(("数字循环顺子", 1.0, [], ["循环递增" if deltas[0] == 1 else "循环递减"]))
             if folded == folded[::-1]:
-                kinds.append(("回文对称", 1.0, [], ["偶数对称" if length % 2 == 0 else "奇数对称"]))
+                kinds.append(("纯数字回文" if folded.isdigit() else "含字母回文", 1.0, [], ["偶数对称" if length % 2 == 0 else "奇数对称"]))
             for series, quality, groups, tags in kinds:
                 yield dict(series=series, start=start, length=length, content=original,
                            group_lengths=[g[1] for g in groups], tags=tags, structure_quality=quality)

@@ -588,7 +588,10 @@ struct PatternParams {
     int suffix_len[8];
     char prefixes[8][40];
     char suffixes[8][40];
+    int independent_rules;
+    int rule_minima[10];
 };
+static_assert(sizeof(PatternParams) == 776, "PatternParams must match Python PATTERN_DTYPE");
 struct MatchRecord {
     u32  thread_id;
     u32  _pad;
@@ -655,11 +658,76 @@ __device__ bool wide_candidate(const char addr[34], int min_len, int max_len, in
     return false;
 }
 
+// Each rule owns its threshold. Zero disables it. Old configurations retain
+// their original predicate; exact mode does not execute either wide path.
+__device__ bool independent_candidate(const char addr[34], const int *lo) {
+    char text[34];
+    for (int i=0; i<34; ++i) text[i]=lower58(addr[i]);
+    int exact=1, folded=1, run=1, block=0, up=1, down=1;
+    int du=1, dd=1, cu=1, cd=1, digits=0;
+    for (int i=0; i<34; ++i) {
+        char b=text[i];
+        bool digit=b>='1' && b<='9';
+        digits=digit ? digits+1 : 0;
+        if (lo[9] && digits>=lo[9]) return true;
+        if (!i) continue;
+        char a=text[i-1];
+        exact=addr[i]==addr[i-1] ? exact+1 : 1;
+        folded=a==b ? folded+1 : 1;
+        if (lo[0] && exact>=lo[0]) return true;
+        if (lo[1] && b>='a' && b<='z' && folded>=lo[1]) return true;
+        if (a==b) ++run;
+        else { block=run>=2 ? block+run : 0; run=1; }
+        bool family=(a>='a' && a<='z' && b>='a' && b<='z') ||
+                    (a>='1' && a<='9' && digit);
+        up=family && (b==a || b==a+1) ? up+1 : 1;
+        down=family && (b==a || b==a-1) ? down+1 : 1;
+        if (lo[2] && ((run>=2 && block+run>=lo[2]) || up>=lo[2] || down>=lo[2])) return true;
+        du=a>='1' && a<='8' && b==a+1 ? du+1 : 1;
+        dd=a>='2' && a<='9' && b==a-1 ? dd+1 : 1;
+        if (lo[3] && (du>=lo[3] || dd>=lo[3])) return true;
+        cu=digit && a>='1' && a<='9' && (b==a+1 || (a=='9' && b=='1')) ? cu+1 : 1;
+        cd=digit && a>='1' && a<='9' && (b==a-1 || (a=='1' && b=='9')) ? cd+1 : 1;
+        if (lo[4] && (cu>=lo[4] || cd>=lo[4])) return true;
+    }
+    if (lo[5] || lo[6]) {
+        for (int period=2; period<=4; ++period) {
+            int span=period, digit_span=0, last_letter=-1;
+            for (int i=0; i<34; ++i) {
+                bool digit=text[i]>='1' && text[i]<='9';
+                digit_span=digit ? digit_span+1 : 0;
+                if (!digit) last_letter=i;
+                if (i<period) continue;
+                span=text[i]==text[i-period] ? span+1 : period;
+                int required=lo[5]>2*period ? lo[5] : 2*period;
+                if (lo[5] && span>=required && digit_span>=required) return true;
+                required=lo[6]>2*period ? lo[6] : 2*period;
+                if (lo[6] && span>=required && last_letter>=i-span+1) return true;
+            }
+        }
+    }
+    if (lo[7] || lo[8]) {
+        for (int center=0; center<67; ++center) {
+            int left=center/2, right=(center+1)/2;
+            bool all_digits=true;
+            while (left>=0 && right<34 && text[left]==text[right]) {
+                all_digits=all_digits && text[left]>='1' && text[left]<='9';
+                int length=right-left+1;
+                if (all_digits && lo[7] && length>=lo[7]) return true;
+                if (!all_digits && lo[8] && length>=lo[8]) return true;
+                --left; ++right;
+            }
+        }
+    }
+    return false;
+}
+
 // Test entry point executes the actual coarse predicate on supplied addresses.
 extern "C" __global__ void screen_addresses(const char *addresses, int count,
     const PatternParams *params, unsigned char *hits) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) hits[i] = wide_candidate(addresses+34*i, params->min_len, params->max_len, params->rules);
+    if (i < count) hits[i] = params->independent_rules ? independent_candidate(addresses+34*i, params->rule_minima) :
+        wide_candidate(addresses+34*i, params->min_len, params->max_len, params->rules);
 }
 
 #ifndef SEARCH_MODE
@@ -736,7 +804,8 @@ extern "C" __global__ void vanity_kernel(
                 // Full-address path is intentionally isolated from the exact
                 // tail path.  It is broader, and CPU performs final rules.
                 base58_encode_25(addr, raw);
-                ok = wide_candidate(addr, params.min_len, params.max_len, params.rules);
+                ok = params.independent_rules ? independent_candidate(addr, params.rule_minima) :
+                    wide_candidate(addr, params.min_len, params.max_len, params.rules);
             } else {
                 int max_suffix = 0;
                 for (int si = 0; si < params.suffix_count && si < 8; si++) {

@@ -59,8 +59,8 @@ class RankerTests(unittest.TestCase):
             'aaabbbbcccc': '变长分组', '11122233': '变长分组',
             'abbcccddddeeee': '变长分组', '1122233344455566': '对称分组',
             'abbccddeeff': '变长分组', '12345678': '数字顺子',
-            '987654321': '数字顺子', 'ABABABAB': '周期重复', 'ABCABCABC': '周期重复',
-            '12344321': '回文对称', '123454321': '回文对称'}
+            '987654321': '数字顺子', 'ABABABAB': '含字母周期重复', 'ABCABCABC': '含字母周期重复',
+            '12344321': '纯数字回文', '123454321': '纯数字回文'}
         for text, series in examples.items():
             with self.subTest(text=text):
                 self.assertEqual(self.match(text, series)['content'], text)
@@ -86,9 +86,9 @@ class RankerTests(unittest.TestCase):
         self.assertGreater(self.match('aaaaaaaaaa', '纯豹子')['scores']['有意义长度'],
                            self.match('aaaaaaaa', '纯豹子')['scores']['有意义长度'])
         full = ranker.score_match(next(m for m in ranker.find_matches(embed('ABCABCABCABC'))
-                                      if m['series'] == '周期重复' and m['content'] == 'ABCABCABCABC'), self.config)
+                                      if m['series'] == '含字母周期重复' and m['content'] == 'ABCABCABCABC'), self.config)
         partial = ranker.score_match(next(m for m in ranker.find_matches(embed('ABCABCABCAB'))
-                                         if m['series'] == '周期重复' and m['content'] == 'ABCABCABCAB'), self.config)
+                                         if m['series'] == '含字母周期重复' and m['content'] == 'ABCABCABCAB'), self.config)
         self.assertGreater(full['scores']['结构规整'], partial['scores']['结构规整'])
 
     def test_positions_and_same_fragment_scoring(self):

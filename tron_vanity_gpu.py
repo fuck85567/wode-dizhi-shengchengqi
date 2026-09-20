@@ -14,7 +14,7 @@ from collections import deque
 from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from cpu_worker import (classify_batch, gen_startpoints_batch, init_classifier,
-                        validate_config, split_targets, rule_mask)
+                        validate_config, split_targets, rule_mask, RULE_SPECS)
 if getattr(sys, "frozen", False):
     _base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
     for _rel in ("", os.path.join("nvidia", "cuda_runtime", "bin"), os.path.join("nvidia", "cuda_nvrtc", "bin")):
@@ -144,6 +144,7 @@ PATTERN_DTYPE = np.dtype([
     ("min_len", np.int32), ("max_len", np.int32), ("rules", np.int32),
     ("prefix_len", np.int32, 8), ("suffix_len", np.int32, 8),
     ("prefixes", np.uint8, (8, 40)), ("suffixes", np.uint8, (8, 40)),
+    ("independent_rules", np.int32), ("rule_minima", np.int32, 10),
 ], align=True)
 MATCH_DTYPE = np.dtype([
     ("thread_id", np.uint32),
@@ -181,6 +182,9 @@ def make_pattern_params(cfg):
     pp_local["min_len"] = int(cfg.get("min_len", 8))
     pp_local["max_len"] = int(cfg.get("max_len", 34))
     pp_local["rules"] = rule_mask(cfg)
+    if "rule_minima" in cfg:
+        pp_local["independent_rules"] = 1
+        pp_local["rule_minima"][0] = [cfg["rule_minima"].get(s[0], 0) for s in RULE_SPECS]
     for i, value in enumerate(ps):
         pp_local["prefix_len"][0, i] = len(value)
         pp_local["prefixes"][0, i, :len(value)] = np.frombuffer(value.encode(), dtype=np.uint8)
@@ -257,6 +261,8 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
     parts = []
     if mode == "wide":
         pattern_desc = "全地址靓号宽筛 {}-{} 位".format(config.get("min_len", 8), config.get("max_len", 34))
+        if "rule_minima" in config:
+            pattern_desc = "全地址独立规则宽筛"
     else:
         if prefix: parts.append("前缀={}".format(prefix))
         if suffix: parts.append("后缀={}".format(suffix))
@@ -271,6 +277,11 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
     print("  GPU 并发线程 : {} (= {} block × {})".format(n_threads, n_blocks, THREADS_PER_BLOCK))
     print("  CPU 分类      : GPU 命中后二次校验和分类 (CPU 暴力搜索关闭, 本机 {} 核)".format(cpu_count))
     print("  搜索模式     : {}".format(pattern_desc))
+    if "rule_minima" in config:
+        for key, label, maximum, *_ in RULE_SPECS:
+            minimum = config["rule_minima"].get(key, 0)
+            if minimum:
+                print("    {}：{}～{} 位".format(label, minimum, maximum))
     if prob > 0:
         print("  理论概率     : 平均 {} 个地址出 1 个".format(fmt_num(1 / prob)))
     print("  输出文件     : {}".format(output_path))
@@ -489,7 +500,8 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
     unsubmitted_start = 0
     batches = iter(())
     metrics = {"addresses": 0, "candidates": 0, "classified": 0, "saved": 0,
-               "overflow_replays": 0, "dropped_candidates": 0, "backpressure_seconds": 0.0}
+               "overflow_replays": 0, "dropped_candidates": 0, "backpressure_seconds": 0.0,
+               "saved_by_type": {}}
     started = time.monotonic()
     deadline = started + duration_minutes*60 if duration_minutes else float("inf")
     interrupted = threading.Event()
@@ -619,12 +631,15 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
                 ready = [future for future in pending if future.done()]
                 if ready:
                     saved = classified = 0
+                    type_counts = {}
                     for future in ready:
                         records = future.result()
                         for record in records:
                             if index.execute("INSERT OR IGNORE INTO addresses VALUES (?)", (record["address"],)).rowcount:
                                 output.write(json.dumps(record, ensure_ascii=False) + "\n")
                                 saved += 1
+                                for kind in {m["type"] for m in record.get("matches", [])}:
+                                    type_counts[kind] = type_counts.get(kind, 0)+1
                         classified += len(pending[future])
                     # Commit all currently ready batches together. Retain raw
                     # candidates until both JSONL and dedup writes succeed.
@@ -634,6 +649,8 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
                     index.commit()
                     metrics["saved"] += saved
                     metrics["classified"] += classified
+                    for kind, count in type_counts.items():
+                        metrics["saved_by_type"][kind] = metrics["saved_by_type"].get(kind, 0)+count
                     for future in ready:
                         del pending[future]
                 elif pending:
@@ -763,6 +780,9 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
         print("\n生成 {}，候选 {}，已分类 {}，保存 {}，溢出重放 {} 次。".format(
             metrics["addresses"], metrics["candidates"], metrics["classified"],
             metrics["saved"], metrics["overflow_replays"]))
+        if metrics["saved_by_type"]:
+            print("各类型保存数（同一地址可计入多个类型）：" + "；".join(
+                "{} {}".format(kind, count) for kind, count in metrics["saved_by_type"].items()))
     if error:
         raise error
     return metrics
@@ -787,30 +807,29 @@ def prompt_mode_1():
                 "combine_or": combine == "OR"}
 
 def prompt_mode_2():
+    print("每项只填最低长度；例如填 10 表示 10～34 位，留空回车关闭。")
+    print("搜索任意位置。耗时按约 3.92 亿地址/秒估算，不是实测或出号保证。")
+    print("示范值仅供参考，不会自动填入；全部留空时需要重新选择。")
     while True:
-        s = input("靓号长度范围 [默认 8-34；单值 8 表示 8-8]: ").strip() or "8-34"
+        minima = {}
+        for key, label, maximum, example, estimate, suggested in RULE_SPECS:
+            print("\n{}\n  示例：{}\n  参考：{}；示范填写：{}".format(label, example, estimate, suggested))
+            while True:
+                value = input("  最低长度（2～{}，留空关闭）：".format(maximum)).strip()
+                if not value:
+                    minima[key] = 0
+                    break
+                if value.isascii() and value.isdigit() and 2 <= int(value) <= maximum:
+                    minima[key] = int(value)
+                    break
+                print("  请输入 2～{} 的整数；只填最低长度，不填范围。".format(maximum))
+        config = dict(mode="wide", rule_minima=minima)
         try:
-            if "-" in s:
-                a, b = [int(x.strip()) for x in s.split("-", 1)]
-            else:
-                a = b = int(s)
-        except ValueError:
-            print("错误: 请输入整数或 min-max。\n"); continue
-        if a < 2 or b < a or b > 34:
-            print("错误: 长度必须满足 2 <= 最小值 <= 最大值 <= 34。\n"); continue
-        rules = {}
-        for key, label in (("same", "连续相同字符"), ("folded", "同字母忽略大小写"),
-                           ("groups", "连续分组（含顺序分组）"),
-                           ("straight", "数字顺子"), ("periodic", "周期重复"),
-                           ("palindrome", "回文/对称")):
-            ans = input("开启{}? [Y/n]: ".format(label)).strip().lower()
-            rules[key] = ans not in ("n", "no", "否", "0")
-        if not any(rules.values()):
-            print("至少开启一种规则。")
-            continue
-        if a < 8:
-            print("提示: 小于 8 位可能产生大量候选；过载将报警并减速，不会自动提高长度。")
-        return {"mode": "wide", "min_len": a, "max_len": b, "rules": rules}
+            return validate_config(config)
+        except ValueError as exc:
+            print("\n{}，请重新填写。".format(exc))
+
+
 def main():
     print("=" * 70)
     print("  TRON 靓号地址生成器 (CUDA + CPU 全速版)")
