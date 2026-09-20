@@ -590,8 +590,10 @@ struct PatternParams {
     char suffixes[8][40];
     int independent_rules;
     int rule_minima[10];
+    int edge_rules[2];
+    int edge_lengths[2];
 };
-static_assert(sizeof(PatternParams) == 776, "PatternParams must match Python PATTERN_DTYPE");
+static_assert(sizeof(PatternParams) == 792, "PatternParams must match Python PATTERN_DTYPE");
 struct MatchRecord {
     u32  thread_id;
     u32  _pad;
@@ -722,6 +724,32 @@ __device__ bool independent_candidate(const char addr[34], const int *lo) {
     return false;
 }
 
+__device__ bool edge_candidate(const char *text, int length, int rule,
+                               const char targets[8][40], int count) {
+    if (rule == 5) {
+        for (int t=0; t<count; ++t) {
+            bool equal=true;
+            for (int i=0; i<length; ++i) if (text[i]!=targets[t][i]) { equal=false; break; }
+            if (equal) return true;
+        }
+        return false;
+    }
+    bool up=true, down=true;
+    for (int i=0; i<length; ++i) {
+        char c=text[i], folded=lower58(c);
+        if (rule==1 && c!=text[0]) return false;
+        if (rule==2 && (folded<'a' || folded>'z' || folded!=lower58(text[0]))) return false;
+        if (rule==3 || rule==4) {
+            if (c<'1' || c>'9') return false;
+            if (i) {
+                up=up && (c==text[i-1]+1 || (rule==4 && text[i-1]=='9' && c=='1'));
+                down=down && (c==text[i-1]-1 || (rule==4 && text[i-1]=='1' && c=='9'));
+            }
+        }
+    }
+    return rule==1 || rule==2 || ((rule==3 || rule==4) && (up || down));
+}
+
 // Test entry point executes the actual coarse predicate on supplied addresses.
 extern "C" __global__ void screen_addresses(const char *addresses, int count,
     const PatternParams *params, unsigned char *hits) {
@@ -806,6 +834,21 @@ extern "C" __global__ void vanity_kernel(
                 base58_encode_25(addr, raw);
                 ok = params.independent_rules ? independent_candidate(addr, params.rule_minima) :
                     wide_candidate(addr, params.min_len, params.max_len, params.rules);
+            } else if (params.edge_rules[0] || params.edge_rules[1]) {
+                bool has_prefix=params.edge_rules[0]!=0, has_suffix=params.edge_rules[1]!=0;
+                bool suffix_ok=!has_suffix;
+                if (has_suffix) {
+                    char reversed[34], suffix[34];
+                    int n=params.edge_lengths[1];
+                    base58_tail(reversed, raw, n);
+                    for (int i=0; i<n; ++i) suffix[i]=reversed[n-1-i];
+                    suffix_ok=edge_candidate(suffix,n,params.edge_rules[1],params.suffixes,params.suffix_count);
+                }
+                if (!suffix_ok && (!params.combine_or || !has_prefix)) continue;
+                base58_encode_25(addr,raw);
+                bool prefix_ok=!has_prefix;
+                if (has_prefix) prefix_ok=edge_candidate(addr+1,params.edge_lengths[0],params.edge_rules[0],params.prefixes,params.prefix_count);
+                ok=params.combine_or ? ((has_prefix && prefix_ok) || (has_suffix && suffix_ok)) : prefix_ok && suffix_ok;
             } else {
                 int max_suffix = 0;
                 for (int si = 0; si < params.suffix_count && si < 8; si++) {

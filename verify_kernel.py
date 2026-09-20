@@ -183,6 +183,7 @@ def verify_host_screen():
     source = source.replace("__device__", "").replace("__forceinline__", "inline")
     source += '\nextern "C" __declspec(dllexport) int host_screen(const char *a, int lo, int hi, int mask) { return wide_candidate(a,lo,hi,mask); }\n'
     source += '\nextern "C" __declspec(dllexport) int host_independent(const char *a, const int *lo) { return independent_candidate(a,lo); }\n'
+    source += '\nextern "C" __declspec(dllexport) int host_edge(const char *a, int n, int rule, const char *targets, int count) { return edge_candidate(a,n,rule,(const char (*)[40])targets,count); }\n'
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory)/"screen.cpp"
         path.write_text(source, encoding="utf-8")
@@ -222,6 +223,20 @@ def verify_host_screen():
                 assert not classify_vanity(address, config) or hit, (config, address)
                 comparisons += 1
         print("Independent thresholds: {} comparisons, no false negatives (host execution).".format(comparisons))
+        from cpu_worker import edge_matches, EDGE_RULES
+        edge = lib.host_edge
+        edge.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        edge.restype = ctypes.c_int
+        checked = 0
+        for address in addresses:
+            for length in (1, 2, 8, 9, 16, 33):
+                for text in (address[1:1+length], address[-length:]):
+                    for rule, code in EDGE_RULES.items():
+                        spec = dict(rule=rule, targets=text)
+                        targets = text.encode().ljust(40,b'\0')+b'\0'*280
+                        assert bool(edge(text.encode(),length,code,targets,1)) == edge_matches(text,spec)
+                        checked += 1
+        print("Edge CPU/CUDA predicate agreement: {} comparisons (host execution).".format(checked))
         # Windows holds loaded DLLs open until FreeLibrary.
         import _ctypes
         _ctypes.FreeLibrary(lib._handle)

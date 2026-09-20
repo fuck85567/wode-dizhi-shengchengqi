@@ -25,6 +25,23 @@ RULE_SPECS = (
     ("digits", "任意连续纯数字", 34, "5837291648357291", "16位约25分钟", 16),
 )
 SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+EDGE_RULES = {"same": 1, "folded": 2, "straight": 3, "cyclic": 4, "literal": 5}
+
+
+def edge_matches(text, spec):
+    rule = spec["rule"]
+    if rule == "literal":
+        return text in split_targets(spec["targets"])
+    if rule == "same":
+        return len(set(text)) == 1
+    folded = text.lower()
+    if rule == "folded":
+        return folded.isalpha() and len(set(folded)) == 1
+    if not all(c in "123456789" for c in text):
+        return False
+    diffs = [int(b)-int(a) for a, b in zip(text, text[1:])]
+    return (all(d == 1 for d in diffs) or all(d == -1 for d in diffs)) if rule == "straight" else (
+        all(d % 9 == 1 for d in diffs) or all(d % 9 == 8 for d in diffs))
 
 
 def _priv_to_address(priv_bytes):
@@ -66,6 +83,24 @@ def validate_config(config):
         if not rule_mask(config):
             raise ValueError("至少开启一种规则")
     else:
+        if "edges" in config:
+            edges = config["edges"]
+            if not isinstance(edges, dict) or not edges or set(edges)-{"prefix", "suffix"}:
+                raise ValueError("至少开启前缀或后缀")
+            for side, spec in edges.items():
+                if not isinstance(spec, dict) or spec.get("rule") not in EDGE_RULES:
+                    raise ValueError("前后缀规则无效")
+                n = spec.get("length")
+                limit = 33 if side == "prefix" else 34
+                if type(n) is not int or not 1 <= n <= limit:
+                    raise ValueError("前缀位数1～33（不含T），后缀位数1～34")
+                if spec["rule"] == "straight" and n > 9:
+                    raise ValueError("普通数字顺子最多9位")
+                if spec["rule"] == "literal":
+                    targets = split_targets(spec.get("targets", ""))
+                    if not 1 <= len(targets) <= 8 or any(len(t) != n or any(c not in BASE58_ALPHABET for c in t) for t in targets):
+                        raise ValueError("特定字符需1～8个目标，每个长度与设置位数一致，且必须为Base58字符")
+            return config
         ps, ss = split_targets(config.get("prefix", "")), split_targets(config.get("suffix", ""))
         if not ps and not ss:
             raise ValueError("至少输入一个前缀或后缀")
@@ -144,6 +179,19 @@ def classify_vanity(address, config):
     if config.get("mode") == "wide" and "rule_minima" in config:
         return classify_independent(address, config["rule_minima"])
     if config.get("mode") == "exact":
+        if "edges" in config:
+            matches, satisfied = [], []
+            for side, spec in config["edges"].items():
+                n = spec["length"]
+                start = 1 if side == "prefix" else 34-n
+                ok = edge_matches(address[start:start+n], spec)
+                satisfied.append(ok)
+                if ok:
+                    match = _match(address, start, n, "前缀" if side == "prefix" else "后缀", tags=[spec["rule"]])
+                    match.update(rule=spec["rule"], edge=side)
+                    matches.append(match)
+            ok = any(satisfied) if config.get("combine_or") else all(satisfied)
+            return _summary(matches) if ok and satisfied else None
         prefixes, suffixes = split_targets(config.get("prefix", "")), split_targets(config.get("suffix", ""))
         ps = [p for p in prefixes if address.startswith(p)]
         ss = [s for s in suffixes if address.endswith(s)]
@@ -333,6 +381,8 @@ def classify_and_verify(priv_hex, gpu_address, config):
                       time=datetime.now(timezone.utc).isoformat(), schema_version=1)
         if "rule_minima" in config:
             result.update(rule_minima=dict(config["rule_minima"]), schema_version=2)
+        if "edges" in config:
+            result.update(edge_config=config["edges"], combine_or=bool(config.get("combine_or")), schema_version=3)
     return result
 
 

@@ -14,7 +14,7 @@ from collections import deque
 from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from cpu_worker import (classify_batch, gen_startpoints_batch, init_classifier,
-                        validate_config, split_targets, rule_mask, RULE_SPECS)
+                        validate_config, split_targets, rule_mask, RULE_SPECS, EDGE_RULES)
 if getattr(sys, "frozen", False):
     _base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
     for _rel in ("", os.path.join("nvidia", "cuda_runtime", "bin"), os.path.join("nvidia", "cuda_nvrtc", "bin")):
@@ -145,6 +145,7 @@ PATTERN_DTYPE = np.dtype([
     ("prefix_len", np.int32, 8), ("suffix_len", np.int32, 8),
     ("prefixes", np.uint8, (8, 40)), ("suffixes", np.uint8, (8, 40)),
     ("independent_rules", np.int32), ("rule_minima", np.int32, 10),
+    ("edge_rules", np.int32, 2), ("edge_lengths", np.int32, 2),
 ], align=True)
 MATCH_DTYPE = np.dtype([
     ("thread_id", np.uint32),
@@ -191,6 +192,16 @@ def make_pattern_params(cfg):
     for i, value in enumerate(ss):
         pp_local["suffix_len"][0, i] = len(value)
         pp_local["suffixes"][0, i, :len(value)] = np.frombuffer(value.encode(), dtype=np.uint8)
+    for side_index, side in enumerate(("prefix", "suffix")):
+        spec = cfg.get("edges", {}).get(side)
+        if spec:
+            pp_local["edge_rules"][0, side_index] = EDGE_RULES[spec["rule"]]
+            pp_local["edge_lengths"][0, side_index] = spec["length"]
+            targets = split_targets(spec.get("targets", "")) if spec["rule"] == "literal" else []
+            pp_local[side+"_count"] = len(targets)
+            for i, target in enumerate(targets):
+                pp_local[side+"_len"][0, i] = len(target)
+                pp_local[side+"es"][0, i, :len(target)] = np.frombuffer(target.encode(), dtype=np.uint8)
     return pp_local
 
 
@@ -267,6 +278,8 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
         if prefix: parts.append("前缀={}".format(prefix))
         if suffix: parts.append("后缀={}".format(suffix))
         pattern_desc = (" OR " if combine_or else " AND ").join(parts)
+    if "edges" in config:
+        pattern_desc = (" OR " if combine_or else " AND ").join("{} {}位 {}".format(side, spec["length"], spec.get("targets") or spec["rule"]) for side, spec in config["edges"].items())
     prob = 0.0  # Overlapping rules do not have a reliable simple ETA.
     print()
     print("=" * 70)
@@ -789,22 +802,52 @@ def run_pipeline(kernel, params, config, output_path, duration_minutes, states,
 
 
 def prompt_mode_1():
+    print("前缀从固定 T 后开始，位数不包含 T；后缀从地址末尾计算。")
+    print("填8表示检查首/尾8位；更长的同类结构也会命中这8位。")
+    choices = {"1": "same", "2": "folded", "3": "straight", "4": "cyclic", "5": "literal"}
     while True:
-        prefix = input("请输入前缀列表 (逗号分隔, 留空表示无, 必须以 T 开头): ").strip()
-        suffix = input("请输入后缀列表 (逗号分隔, 留空表示无): ").strip()
-        if not prefix and not suffix:
-            print("错误: 前缀和后缀至少填写一项。\n")
+        edges = {}
+        for side, label, limit in (("prefix", "前缀", 33), ("suffix", "后缀", 34)):
+            while True:
+                enabled = input("是否开启{}？[y/n，默认n]：".format(label)).strip().lower() or "n"
+                if enabled in ("y", "n"):
+                    break
+                print("请输入 y 或 n。")
+            if enabled == "n":
+                continue
+            while True:
+                value = input("{}位数（1～{}，例如8）：".format(label, limit)).strip()
+                if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= limit:
+                    print("请输入有效位数。")
+                    continue
+                length = int(value)
+                print("① 纯豹子，区分大小写  ② 同字母，忽略大小写")
+                print("③ 普通数字顺子  ④ 数字循环顺子  ⑤ 特定字符（区分大小写）")
+                choice = input("选择规则 [1/2/3/4/5]：").strip()
+                if choice not in choices:
+                    print("请输入1～5。")
+                    continue
+                spec = dict(rule=choices[choice], length=length)
+                if choice == "5":
+                    spec["targets"] = input("输入完整目标（多个用逗号分隔，每个{}位；前缀不包含固定T）：".format(length)).strip()
+                try:
+                    validate_config(dict(mode="exact", edges={side: spec}))
+                except ValueError as exc:
+                    print(exc)
+                    continue
+                edges[side] = spec
+                break
+        if not edges:
+            print("至少开启前缀或后缀。")
             continue
-        combine = input("前缀/后缀组合 [AND/OR，默认 AND]: ").strip().upper() or "AND"
-        if combine not in ("AND", "OR"):
-            print("请输入 AND 或 OR。")
-            continue
-        errs = validate_pattern(prefix, suffix, combine == "OR")
-        if errs:
-            print("输入有误: " + "; ".join(errs))
-            continue
-        return {"mode": "exact", "prefix": prefix, "suffix": suffix,
-                "combine_or": combine == "OR"}
+        combine = "AND"
+        if len(edges) == 2:
+            while True:
+                combine = input("前后缀组合 [AND/OR，默认AND]：").strip().upper() or "AND"
+                if combine in ("AND", "OR"):
+                    break
+                print("请输入AND或OR。")
+        return dict(mode="exact", edges=edges, combine_or=combine == "OR")
 
 def prompt_mode_2():
     print("每项只填最低长度；例如填 10 表示 10～34 位，留空回车关闭。")
