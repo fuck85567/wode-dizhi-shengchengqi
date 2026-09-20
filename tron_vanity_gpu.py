@@ -280,7 +280,14 @@ def run_search(config: dict, output_path: str, duration_minutes: float = 0):
         if suffix: parts.append("后缀={}".format(suffix))
         pattern_desc = (" OR " if combine_or else " AND ").join(parts)
     if "edges" in config:
-        pattern_desc = (" OR " if combine_or else " AND ").join("{} {}位 {}".format(side, spec["length"], spec.get("targets") or spec["rule"]) for side, spec in config["edges"].items())
+        side_parts = []
+        for side, raw_specs in config["edges"].items():
+            specs = raw_specs if isinstance(raw_specs, list) else [raw_specs]
+            rules = "/".join("{} {}位 {}".format(
+                side, spec["length"], spec.get("targets") or spec["rule"]
+            ) for spec in specs)
+            side_parts.append(rules)
+        pattern_desc = (" OR " if combine_or else " AND ").join(side_parts)
     prob = 0.0  # Overlapping rules do not have a reliable simple ETA.
     print()
     print("=" * 70)
