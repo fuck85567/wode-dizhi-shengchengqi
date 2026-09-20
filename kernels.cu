@@ -590,10 +590,10 @@ struct PatternParams {
     char suffixes[8][40];
     int independent_rules;
     int rule_minima[10];
-    int edge_rules[2];
-    int edge_lengths[2];
+    int edge_rules[2][5];
+    int edge_lengths[2][5];
 };
-static_assert(sizeof(PatternParams) == 792, "PatternParams must match Python PATTERN_DTYPE");
+static_assert(sizeof(PatternParams) == 856, "PatternParams must match Python PATTERN_DTYPE");
 struct MatchRecord {
     u32  thread_id;
     u32  _pad;
@@ -834,20 +834,26 @@ extern "C" __global__ void vanity_kernel(
                 base58_encode_25(addr, raw);
                 ok = params.independent_rules ? independent_candidate(addr, params.rule_minima) :
                     wide_candidate(addr, params.min_len, params.max_len, params.rules);
-            } else if (params.edge_rules[0] || params.edge_rules[1]) {
-                bool has_prefix=params.edge_rules[0]!=0, has_suffix=params.edge_rules[1]!=0;
+            } else if (params.edge_rules[0][0] || params.edge_rules[1][0]) {
+                bool has_prefix=params.edge_rules[0][0]!=0, has_suffix=params.edge_rules[1][0]!=0;
                 bool suffix_ok=!has_suffix;
                 if (has_suffix) {
                     char reversed[34], suffix[34];
-                    int n=params.edge_lengths[1];
-                    base58_tail(reversed, raw, n);
-                    for (int i=0; i<n; ++i) suffix[i]=reversed[n-1-i];
-                    suffix_ok=edge_candidate(suffix,n,params.edge_rules[1],params.suffixes,params.suffix_count);
+                    int max_suffix = 0;
+                    for (int ri=0; ri<5 && params.edge_rules[1][ri]; ++ri)
+                        if (params.edge_lengths[1][ri] > max_suffix) max_suffix = params.edge_lengths[1][ri];
+                    base58_tail(reversed, raw, max_suffix);
+                    for (int ri=0; ri<5 && params.edge_rules[1][ri]; ++ri) {
+                        int n=params.edge_lengths[1][ri];
+                        for (int i=0; i<n; ++i) suffix[i]=reversed[n-1-i];
+                        if (edge_candidate(suffix,n,params.edge_rules[1][ri],params.suffixes,params.suffix_count)) suffix_ok=true;
+                    }
                 }
                 if (!suffix_ok && (!params.combine_or || !has_prefix)) continue;
                 base58_encode_25(addr,raw);
                 bool prefix_ok=!has_prefix;
-                if (has_prefix) prefix_ok=edge_candidate(addr+1,params.edge_lengths[0],params.edge_rules[0],params.prefixes,params.prefix_count);
+                if (has_prefix) for (int ri=0; ri<5 && params.edge_rules[0][ri]; ++ri)
+                    if (edge_candidate(addr+1,params.edge_lengths[0][ri],params.edge_rules[0][ri],params.prefixes,params.prefix_count)) prefix_ok=true;
                 ok=params.combine_or ? ((has_prefix && prefix_ok) || (has_suffix && suffix_ok)) : prefix_ok && suffix_ok;
             } else {
                 int max_suffix = 0;

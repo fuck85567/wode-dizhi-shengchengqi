@@ -23,8 +23,8 @@ class EdgeTests(unittest.TestCase):
                 self.assertIsNone(classify_vanity(embed(fragment, 10), cfg))
                 params = make_pattern_params(cfg)
                 index = int(side == 'suffix')
-                self.assertEqual(params['edge_rules'][0,index], EDGE_RULES[rule])
-                self.assertEqual(params['edge_lengths'][0,index], 8)
+                self.assertEqual(params['edge_rules'][0,index,0], EDGE_RULES[rule])
+                self.assertEqual(params['edge_lengths'][0,index,0], 8)
         self.assertFalse(edge_matches('AaAAAAAA', dict(rule='same')))
         self.assertFalse(edge_matches('11111111', dict(rule='folded')))
         self.assertFalse(edge_matches('78912345', dict(rule='straight')))
@@ -50,11 +50,22 @@ class EdgeTests(unittest.TestCase):
     def test_prompt_flow(self):
         with patch('builtins.input', side_effect=['n','y','8','2']), contextlib.redirect_stdout(io.StringIO()):
             cfg = prompt_mode_1()
-        self.assertEqual(cfg, dict(mode='exact',edges={'suffix':dict(rule='folded',length=8)},combine_or=False))
-        with patch('builtins.input', side_effect=['y','3','5','ABC','y','8','1','OR']), contextlib.redirect_stdout(io.StringIO()):
+        self.assertEqual(cfg, dict(mode='exact',edges={'suffix':[dict(rule='folded',length=8)]},combine_or=False))
+        with patch('builtins.input', side_effect=['y','3','15','ABC','y','8','14','OR']), contextlib.redirect_stdout(io.StringIO()):
             cfg = prompt_mode_1()
         self.assertTrue(cfg['combine_or'])
-        self.assertEqual(cfg['edges']['prefix']['targets'],'ABC')
+        self.assertEqual([x['rule'] for x in cfg['edges']['prefix']], ['same','literal'])
+        self.assertEqual(cfg['edges']['prefix'][1]['targets'],'ABC')
+
+    def test_multiple_rules_same_side(self):
+        cfg = dict(mode='exact', edges={'suffix': [
+            dict(rule='same', length=8),
+            dict(rule='straight', length=8),
+            dict(rule='cyclic', length=8),
+        ]})
+        self.assertIsNotNone(classify_vanity(embed('88888888', 26), cfg))
+        self.assertIsNotNone(classify_vanity(embed('23456789', 26), cfg))
+        self.assertIsNotNone(classify_vanity(embed('78912345', 26), cfg))
 
 
 if __name__ == '__main__':

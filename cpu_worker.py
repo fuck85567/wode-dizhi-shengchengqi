@@ -87,19 +87,23 @@ def validate_config(config):
             edges = config["edges"]
             if not isinstance(edges, dict) or not edges or set(edges)-{"prefix", "suffix"}:
                 raise ValueError("至少开启前缀或后缀")
-            for side, spec in edges.items():
-                if not isinstance(spec, dict) or spec.get("rule") not in EDGE_RULES:
-                    raise ValueError("前后缀规则无效")
-                n = spec.get("length")
-                limit = 33 if side == "prefix" else 34
-                if type(n) is not int or not 1 <= n <= limit:
-                    raise ValueError("前缀位数1～33（不含T），后缀位数1～34")
-                if spec["rule"] == "straight" and n > 9:
-                    raise ValueError("普通数字顺子最多9位")
-                if spec["rule"] == "literal":
-                    targets = split_targets(spec.get("targets", ""))
-                    if not 1 <= len(targets) <= 8 or any(len(t) != n or any(c not in BASE58_ALPHABET for c in t) for t in targets):
-                        raise ValueError("特定字符需1～8个目标，每个长度与设置位数一致，且必须为Base58字符")
+            for side, raw_specs in edges.items():
+                specs = raw_specs if isinstance(raw_specs, list) else [raw_specs]
+                if not specs or len(specs) > 5:
+                    raise ValueError("每侧至少选择一种、最多五种规则")
+                for spec in specs:
+                    if not isinstance(spec, dict) or spec.get("rule") not in EDGE_RULES:
+                        raise ValueError("前后缀规则无效")
+                    n = spec.get("length")
+                    limit = 33 if side == "prefix" else 34
+                    if type(n) is not int or not 1 <= n <= limit:
+                        raise ValueError("前缀位数1～33（不含T），后缀位数1～34")
+                    if spec["rule"] == "straight" and n > 9:
+                        raise ValueError("普通数字顺子最多9位")
+                    if spec["rule"] == "literal":
+                        targets = split_targets(spec.get("targets", ""))
+                        if not 1 <= len(targets) <= 8 or any(len(t) != n or any(c not in BASE58_ALPHABET for c in t) for t in targets):
+                            raise ValueError("特定字符需1～8个目标，每个长度与设置位数一致，且必须为Base58字符")
             return config
         ps, ss = split_targets(config.get("prefix", "")), split_targets(config.get("suffix", ""))
         if not ps and not ss:
@@ -181,15 +185,19 @@ def classify_vanity(address, config):
     if config.get("mode") == "exact":
         if "edges" in config:
             matches, satisfied = [], []
-            for side, spec in config["edges"].items():
-                n = spec["length"]
-                start = 1 if side == "prefix" else 34-n
-                ok = edge_matches(address[start:start+n], spec)
-                satisfied.append(ok)
-                if ok:
-                    match = _match(address, start, n, "前缀" if side == "prefix" else "后缀", tags=[spec["rule"]])
-                    match.update(rule=spec["rule"], edge=side)
-                    matches.append(match)
+            for side, raw_specs in config["edges"].items():
+                specs = raw_specs if isinstance(raw_specs, list) else [raw_specs]
+                side_ok = False
+                for spec in specs:
+                    n = spec["length"]
+                    start = 1 if side == "prefix" else 34-n
+                    ok = edge_matches(address[start:start+n], spec)
+                    side_ok = side_ok or ok
+                    if ok:
+                        match = _match(address, start, n, "前缀" if side == "prefix" else "后缀", tags=[spec["rule"]])
+                        match.update(rule=spec["rule"], edge=side)
+                        matches.append(match)
+                satisfied.append(side_ok)
             ok = any(satisfied) if config.get("combine_or") else all(satisfied)
             return _summary(matches) if ok and satisfied else None
         prefixes, suffixes = split_targets(config.get("prefix", "")), split_targets(config.get("suffix", ""))

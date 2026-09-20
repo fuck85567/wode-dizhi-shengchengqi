@@ -145,7 +145,7 @@ PATTERN_DTYPE = np.dtype([
     ("prefix_len", np.int32, 8), ("suffix_len", np.int32, 8),
     ("prefixes", np.uint8, (8, 40)), ("suffixes", np.uint8, (8, 40)),
     ("independent_rules", np.int32), ("rule_minima", np.int32, 10),
-    ("edge_rules", np.int32, 2), ("edge_lengths", np.int32, 2),
+    ("edge_rules", np.int32, (2, 5)), ("edge_lengths", np.int32, (2, 5)),
 ], align=True)
 MATCH_DTYPE = np.dtype([
     ("thread_id", np.uint32),
@@ -193,10 +193,11 @@ def make_pattern_params(cfg):
         pp_local["suffix_len"][0, i] = len(value)
         pp_local["suffixes"][0, i, :len(value)] = np.frombuffer(value.encode(), dtype=np.uint8)
     for side_index, side in enumerate(("prefix", "suffix")):
-        spec = cfg.get("edges", {}).get(side)
-        if spec:
-            pp_local["edge_rules"][0, side_index] = EDGE_RULES[spec["rule"]]
-            pp_local["edge_lengths"][0, side_index] = spec["length"]
+        raw_specs = cfg.get("edges", {}).get(side, [])
+        specs = raw_specs if isinstance(raw_specs, list) else [raw_specs]
+        for rule_index, spec in enumerate(specs[:5]):
+            pp_local["edge_rules"][0, side_index, rule_index] = EDGE_RULES[spec["rule"]]
+            pp_local["edge_lengths"][0, side_index, rule_index] = spec["length"]
             targets = split_targets(spec.get("targets", "")) if spec["rule"] == "literal" else []
             pp_local[side+"_count"] = len(targets)
             for i, target in enumerate(targets):
@@ -823,19 +824,22 @@ def prompt_mode_1():
                 length = int(value)
                 print("① 纯豹子，区分大小写  ② 同字母，忽略大小写")
                 print("③ 普通数字顺子  ④ 数字循环顺子  ⑤ 特定字符（区分大小写）")
-                choice = input("选择规则 [1/2/3/4/5]：").strip()
-                if choice not in choices:
-                    print("请输入1～5。")
+                choice = input("选择规则（可多选，例如1234；特定字符用5）：").strip()
+                if not choice or any(c not in choices for c in choice) or len(set(choice)) != len(choice):
+                    print("请输入不重复的规则编号，例如1234。")
                     continue
-                spec = dict(rule=choices[choice], length=length)
-                if choice == "5":
-                    spec["targets"] = input("输入完整目标（多个用逗号分隔，每个{}位；前缀不包含固定T）：".format(length)).strip()
+                specs = []
+                for selected in choice:
+                    spec = dict(rule=choices[selected], length=length)
+                    if selected == "5":
+                        spec["targets"] = input("输入完整目标（多个用逗号分隔，每个{}位；前缀不包含固定T）：".format(length)).strip()
+                    specs.append(spec)
                 try:
-                    validate_config(dict(mode="exact", edges={side: spec}))
+                    validate_config(dict(mode="exact", edges={side: specs}))
                 except ValueError as exc:
                     print(exc)
                     continue
-                edges[side] = spec
+                edges[side] = specs
                 break
         if not edges:
             print("至少开启前缀或后缀。")

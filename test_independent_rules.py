@@ -78,7 +78,7 @@ class IndependentTests(unittest.TestCase):
         from tron_vanity_gpu import make_pattern_params, PATTERN_DTYPE
         values = {s[0]: s[5] for s in RULE_SPECS}
         params = make_pattern_params(dict(mode='wide', rule_minima=values))
-        self.assertEqual(PATTERN_DTYPE.itemsize, 792)
+        self.assertEqual(PATTERN_DTYPE.itemsize, 856)
         self.assertEqual(PATTERN_DTYPE.fields['independent_rules'][1], 732)
         self.assertEqual(PATTERN_DTYPE.fields['rule_minima'][1], 736)
         self.assertEqual(params['rule_minima'][0].tolist(), list(values.values()))
