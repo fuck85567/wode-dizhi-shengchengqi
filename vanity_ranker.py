@@ -1,4 +1,4 @@
-"""Standalone, standard-library-only TRON vanity ranking and export tool."""
+"""Standalone TRON ranking: longest structure first, then closest to either edge."""
 import argparse
 import codecs
 import csv
@@ -20,43 +20,19 @@ KEY_RE = re.compile(r"(?<![A-Za-z0-9])[0-9a-fA-F]{64}(?![A-Za-z0-9])")
 ADDRESS_FIELDS = ("address", "地址", "钱包地址", "TRON地址")
 KEY_FIELDS = ("private_key", "privkey", "私钥")
 SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-DIMENSIONS = ("有意义长度", "视觉一致性", "结构规整", "位置", "个人偏好")
 SERIES = ("纯豹子", "同字母混合大小写", "成对分组", "等长多连分组",
           "阶梯分组", "对称分组", "变长分组", "顺序分组", "数字顺子", "数字循环顺子",
           "数字周期重复", "含字母周期重复", "纯数字回文", "含字母回文", "连续纯数字")
-DEFAULT_CONFIG = {
-    "权重": dict(zip(DIMENSIONS, (35, 25, 25, 10, 5))),
-    "位置系数": {"尾部": 1.0, "开头": 0.8, "中间": 0.5},
-    "偏好字符": "",
-    "偏好系列": [],
-}
-SCORING_VERSION = 2
+DEFAULT_CONFIG = {"排序规则": "长度优先，其次靠近首尾"}
+SCORING_VERSION = 3
 
 
 def load_config(path=None):
-    config = json.loads(json.dumps(DEFAULT_CONFIG))
+    config = dict(DEFAULT_CONFIG)
     if path:
         supplied = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-        if not isinstance(supplied, dict) or set(supplied)-set(config):
-            raise ValueError("评分配置含未知字段，参照 ranker_config.example.json")
-        for key, value in supplied.items():
-            if key in ("权重", "位置系数"):
-                if not isinstance(value, dict) or set(value)-set(config[key]):
-                    raise ValueError("配置项 {} 含未知字段".format(key))
-                config[key].update(value)
-            else:
-                config[key] = value
-    weights = config["权重"]
-    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0
-           for v in weights.values()) or not math.isclose(sum(weights.values()), 100):
-        raise ValueError("五项权重必须为非负数，合计 100")
-    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1
-           for v in config["位置系数"].values()):
-        raise ValueError("位置系数必须在 0 到 1 之间")
-    if not isinstance(config["偏好字符"], str) or any(c not in ALPHABET for c in config["偏好字符"]):
-        raise ValueError("偏好字符只能包含 TRON Base58 字符")
-    if not isinstance(config["偏好系列"], list) or any(s not in SERIES for s in config["偏好系列"]):
-        raise ValueError("偏好系列必须是支持的系列名称列表")
+        if supplied != config:
+            raise ValueError("新版固定按长度、首尾距离排序，请使用新版 ranker_config.example.json")
     return config
 
 
@@ -105,10 +81,10 @@ def group_style(groups, direction):
 
 
 def find_matches(address, minimum=8, maximum=34):
-    """Inspect all eligible windows so a shorter, prettier window can win.
+    """Inspect eligible windows, preserving the distinct structure families.
 
-    Unlike the generator's longest-only summary, ranking must retain shorter
-    structures for scoring. All five dimensions always use this same window.
+    A subwindow can belong to a different series than its containing window.
+    Each series chooses its longest match, then the closest one to either edge.
     """
     norm = address.lower()
     singleton, bad_up, bad_down = [0], [0], [0]
@@ -159,59 +135,25 @@ def find_matches(address, minimum=8, maximum=34):
                            group_lengths=[g[1] for g in groups], tags=tags, structure_quality=quality)
 
 
-def visual_quality(text):
-    cases = "".join("U" if c.isupper() else "L" for c in text if c.isalpha())
-    if not cases or len(set(cases)) == 1:
-        quality, reason = 1.0, "大小写统一" if cases else "纯数字"
-    elif all(a != b for a, b in zip(cases, cases[1:])):
-        quality, reason = .95, "大小写规律交替"
-    elif any(len(cases) >= 2*p and cases[p:] == cases[:-p] for p in (2, 3, 4)):
-        quality, reason = .9, "大小写周期变化"
-    elif cases == cases[::-1]:
-        quality, reason = .88, "大小写对称"
-    else:
-        groups = runs(text.lower())
-        offset, uniform = 0, 0
-        for _, length in groups:
-            part = text[offset:offset+length]
-            uniform += part == part.upper() or part == part.lower()
-            offset += length
-        quality, reason = .45+.25*uniform/len(groups), "大小写较杂"
-    if any(c.isalpha() for c in text) and any(c.isdigit() for c in text):
-        quality *= .9
-        reason += "；数字字母混排"
-    return quality, reason
-
-
 def score_match(match, config):
     result = dict(match)
-    length, start, text = match["length"], match["start"], match["content"]
-    visual, visual_reason = visual_quality(text)
-    position = "尾部" if start+length == 34 else "开头" if start <= 1 else "中间"
-    # Logarithmic growth rewards length without letting length erase neatness.
-    # Digits have their actual ceiling of 9; other families have ceiling 34.
-    ceiling = 9 if match["series"] == "数字顺子" else 34
-    preferred = []
-    chars = set(config["偏好字符"].lower())
-    if chars:
-        preferred.append(sum(c in chars for c in text.lower())/length)
-    if config["偏好系列"]:
-        preferred.append(float(match["series"] in config["偏好系列"]))
-    qualities = (math.log(length)/math.log(ceiling), visual, match["structure_quality"],
-                 config["位置系数"][position], sum(preferred)/len(preferred) if preferred else 0)
-    scores = {key: round(config["权重"][key]*quality, 2) for key, quality in zip(DIMENSIONS, qualities)}
-    result.update(score=round(sum(scores.values()), 2), scores=scores, position=position,
-                  groups=len(match["group_lengths"]), position_base=0,
-                  explanation="{}位；{}；{}；{}；{}".format(
-                      length, visual_reason, "、".join(match["tags"]) or match["series"], position,
-                      "未设置偏好" if not preferred else "按字符占比/系列偏好计分"))
-    del result["structure_quality"]
+    length, start = match["length"], match["start"]
+    # Fixed leading T is not an extra gap: start 0 or 1 both touch the head.
+    head_gap = max(0, start-1)
+    tail_gap = 34-start-length
+    distance = min(head_gap, tail_gap)
+    position = "首尾" if head_gap == tail_gap == 0 else "开头" if head_gap == 0 else "尾部" if tail_gap == 0 else "靠近开头" if head_gap <= tail_gap else "靠近尾部"
+    # One character of length always outweighs every possible edge bonus.
+    # Score is kept for machine-readable exports/filtering, not display.
+    score = round(100*(length*100+34-distance)/3434, 6)
+    result.update(score=score, edge_distance=distance, head_distance=head_gap, tail_distance=tail_gap,
+                  position=position, groups=len(match["group_lengths"]), position_base=0)
+    result.pop("structure_quality", None)
     return result
 
 
 def match_order(match):
-    return (-match["score"], -match["length"], -match["scores"]["结构规整"],
-            -match["scores"]["视觉一致性"], SERIES.index(match["series"]), match["start"])
+    return (-match["length"], match["edge_distance"], SERIES.index(match["series"]), match["start"])
 
 
 def rank_address(address, config, minimum=8, maximum=34):
@@ -257,6 +199,8 @@ def read_records(path, issue):
         pending = None
         for number, line in enumerate(f, 1):
             if not line.strip():
+                continue
+            if not is_json and line.split() == ["地址", "位数"]:
                 continue
             if is_json:
                 try:
@@ -323,30 +267,23 @@ def expand_inputs(paths):
     return found
 
 
-CSV_COLUMNS = ["排名", "系列", "总分", "长度分", "视觉分", "结构分", "位置分", "偏好分",
-               "地址", "匹配内容", "有效长度", "位置", "开始位置(从0计)", "组数", "组长度",
-               "结构标签", "评分说明", "记录ID", "私钥冲突"]
+CSV_COLUMNS = ["地址", "位数"]
 
 
-def export_csv(db, path, rows, include_keys=False):
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
+def export_csv(db, path, rows):
+    # The TXT is the primary human-readable view; CSV has the same two columns.
+    with path.open("w", encoding="utf-8-sig", newline="") as f, path.with_suffix(".txt").open("w", encoding="utf-8-sig") as text:
         writer = csv.writer(f)
-        writer.writerow(CSV_COLUMNS + (["私钥"] if include_keys else []))
-        for rank, (address, record_id, payload) in enumerate(rows, 1):
+        writer.writerow(CSV_COLUMNS)
+        text.write("地址                                  位数\n")
+        for address, record_id, payload in rows:
             match = json.loads(payload) if payload else None
-            keys = [row[0] for row in db.execute("SELECT key FROM private_keys WHERE address=? ORDER BY key", (address,))]
-            values = ([rank, match["series"], match["score"]] + [match["scores"][d] for d in DIMENSIONS] +
-                      [address, match["content"], match["length"], match["position"], match["start"], match["groups"],
-                       ",".join(map(str, match["group_lengths"])), "、".join(match["tags"]), match["explanation"],
-                       record_id, "是" if len(keys) > 1 else "否"]) if match else (
-                      [rank, "未匹配", 0]+[0]*5+[address, "", 0, "", "", 0, "", "", "没有符合长度范围的结构", record_id,
-                                                 "是" if len(keys) > 1 else "否"])
-            if include_keys:
-                values.append(keys[0] if len(keys) == 1 else "")
-            writer.writerow(values)
+            length = match["length"] if match else 0
+            writer.writerow([address, length])
+            text.write("{}    {}\n".format(address, length))
 
 
-def run_ranking(inputs, output, config, minimum=8, maximum=34, top=0, min_score=0, include_keys=False):
+def run_ranking(inputs, output, config, minimum=8, maximum=34, top=0, min_score=0):
     if not 2 <= minimum <= maximum <= 34 or top < 0 or not math.isfinite(min_score) or not 0 <= min_score <= 100:
         raise ValueError("长度范围需为 2～34，数量上限需非负，最低分需为 0～100")
     files = expand_inputs(inputs)
@@ -354,8 +291,12 @@ def run_ranking(inputs, output, config, minimum=8, maximum=34, top=0, min_score=
     if output.exists() and any(output.iterdir()):
         raise ValueError("输出目录非空，请指定新目录，避免覆盖已有结果")
     output.mkdir(parents=True, exist_ok=True)
-    (output/"评分配置.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    db = sqlite3.connect(str(output/"评分索引.sqlite3"))
+    details = output/"详细数据"
+    categories = output/"分类"
+    details.mkdir()
+    categories.mkdir()
+    (details/"评分配置.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    db = sqlite3.connect(str(details/"评分索引.sqlite3"))
     db.executescript("""
         CREATE TABLE records(address TEXT PRIMARY KEY, record_id TEXT, payload TEXT, best TEXT, score REAL, length INTEGER);
         CREATE TABLE original_records(address TEXT, source TEXT, line INTEGER, metadata TEXT);
@@ -367,7 +308,7 @@ def run_ranking(inputs, output, config, minimum=8, maximum=34, top=0, min_score=
     stats = dict(input_records=0, unique_addresses=0, duplicates=0, matched_addresses=0,
                  unmatched_addresses=0, import_errors=0, conflicting_addresses=0)
     try:
-        with (output/"导入问题.csv").open("w", encoding="utf-8-sig", newline="") as errors:
+        with (details/"导入问题.csv").open("w", encoding="utf-8-sig", newline="") as errors:
             writer = csv.writer(errors)
             writer.writerow(["来源文件", "行号", "问题"])
             def issue(path, line, reason):
@@ -419,19 +360,19 @@ def run_ranking(inputs, output, config, minimum=8, maximum=34, top=0, min_score=
                          "CREATE INDEX series_ranking ON series(name,score DESC,length DESC,address);")
         stats["conflicting_addresses"] = db.execute(
             "SELECT COUNT(*) FROM (SELECT address FROM private_keys GROUP BY address HAVING COUNT(*)>1)").fetchone()[0]
-        print("正在导出总榜、各系列和完整评分结果……", flush=True)
+        print("正在导出两列排行榜（地址、位数）……", flush=True)
         limit = top if top else -1
         export_csv(db, output/"总排行榜.csv", db.execute(
             "SELECT address,record_id,best FROM records WHERE best IS NOT NULL AND score>=? "
-            "ORDER BY score DESC,length DESC,address LIMIT ?", (min_score, limit)), include_keys)
+            "ORDER BY score DESC,length DESC,address LIMIT ?", (min_score, limit)))
         for series in SERIES:
-            export_csv(db, output/(series+".csv"), db.execute(
+            export_csv(db, categories/(series+".csv"), db.execute(
                 "SELECT s.address,r.record_id,s.payload FROM series s JOIN records r ON r.address=s.address "
                 "WHERE s.name=? AND s.score>=? ORDER BY s.score DESC,s.length DESC,s.address LIMIT ?",
-                (series, min_score, limit)), include_keys)
+                (series, min_score, limit)))
         export_csv(db, output/"未匹配.csv", db.execute(
-            "SELECT address,record_id,best FROM records WHERE best IS NULL ORDER BY address"), include_keys)
-        with (output/"完整评分结果.jsonl").open("w", encoding="utf-8") as f:
+            "SELECT address,record_id,best FROM records WHERE best IS NULL ORDER BY address"))
+        with (details/"完整评分结果.jsonl").open("w", encoding="utf-8") as f:
             for address, payload in db.execute("SELECT address,payload FROM records ORDER BY score DESC,length DESC,address"):
                 record = json.loads(payload)
                 keys = [row[0] for row in db.execute("SELECT key FROM private_keys WHERE address=? ORDER BY key", (address,))]
@@ -446,9 +387,10 @@ def run_ranking(inputs, output, config, minimum=8, maximum=34, top=0, min_score=
                      csv_top_per_list=top, csv_min_score=min_score, inputs=[str(p) for p in files],
                      elapsed_seconds=round(time.monotonic()-started, 2), series_counts=dict(db.execute(
                          "SELECT name,COUNT(*) FROM series GROUP BY name")), complete=True)
-        (output/"统计.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("完成：{} 个地址，{} 个有结构，{} 个未匹配，{} 条导入问题。\n结果目录：{}".format(
-            stats["unique_addresses"], stats["matched_addresses"], stats["unmatched_addresses"], stats["import_errors"], output))
+        (details/"统计.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("完成：{} 个地址，{} 个有结构，{} 个未匹配，{} 条导入问题。\n打开查看：{}\n分类结果：{}".format(
+            stats["unique_addresses"], stats["matched_addresses"], stats["unmatched_addresses"], stats["import_errors"],
+            output/"总排行榜.txt", categories))
         return stats
     finally:
         db.close()
@@ -459,7 +401,7 @@ def main(argv=None):
         for stream in (sys.stdout, sys.stderr):
             if hasattr(stream, "reconfigure"):
                 stream.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description="TRON 靓号离线精品筛选器：五项评分、分系列排名，无需显卡或第三方库")
+    parser = argparse.ArgumentParser(description="TRON 靓号精品筛选器：长度优先，同长度越靠近首尾越靠前；仅显示地址、位数")
     parser.add_argument("inputs", nargs="*", help="JSONL/TXT/CSV 文件或包含这些文件的目录")
     parser.add_argument("-o", "--output", help="新的输出目录，默认 精选结果/当前时间")
     parser.add_argument("--config", help="评分配置 JSON 文件")
@@ -467,10 +409,9 @@ def main(argv=None):
     parser.add_argument("--max-length", type=int, default=34)
     parser.add_argument("--top", type=int, default=0, help="每张排行榜最多几条；0 为全部")
     parser.add_argument("--min-score", type=float, default=0, help="CSV 排行榜最低分；完整 JSONL 始终保留全部有效地址")
-    parser.add_argument("--include-private-keys", action="store_true", help="同时将私钥写入 CSV；默认只在完整 JSONL/索引中保留")
     args = parser.parse_args(argv)
     if not args.inputs:
-        print("TRON 靓号精品筛选器｜长度35 + 视觉25 + 结构25 + 位置10 + 偏好5")
+        print("TRON 靓号精品筛选器｜长度优先，其次靠近首尾｜仅显示地址、位数")
         value = input("请输入结果文件或目录路径（可拖入文件）：").strip().strip('"')
         if not value:
             parser.error("需要一个输入文件或目录")
@@ -478,7 +419,7 @@ def main(argv=None):
     output = args.output or str(Path("精选结果")/datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     try:
         stats = run_ranking(args.inputs, output, load_config(args.config), args.min_length, args.max_length,
-                            args.top, args.min_score, args.include_private_keys)
+                            args.top, args.min_score)
         return 2 if stats["import_errors"] or stats["conflicting_addresses"] else 0
     except (ValueError, OSError, sqlite3.Error) as exc:
         print("错误：{}".format(exc), file=sys.stderr)

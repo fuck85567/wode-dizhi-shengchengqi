@@ -66,36 +66,40 @@ class RankerTests(unittest.TestCase):
                 self.assertEqual(self.match(text, series)['content'], text)
 
     def test_scoring_weights_and_dimensions(self):
-        self.assertEqual(list(self.config['权重'].values()), [35, 25, 25, 10, 5])
+        self.assertEqual(self.config, {'排序规则': '长度优先，其次靠近首尾'})
         for text in ('aabbccdd', 'aAaAAAaaAa', '12344321', 'ABABABAB'):
             for match in ranker.rank_address(embed(text), self.config)['series_matches']:
-                self.assertAlmostEqual(match['score'], sum(match['scores'].values()))
-                for dimension, score in match['scores'].items():
-                    self.assertGreaterEqual(score, 0)
-                    self.assertLessEqual(score, self.config['权重'][dimension])
-                self.assertEqual(match['scores']['个人偏好'], 0)
+                self.assertGreaterEqual(match['score'], 0)
+                self.assertLessEqual(match['score'], 100)
+                self.assertNotIn('scores', match)
 
     def test_visual_structure_and_length_order(self):
         neat = self.match('aabbccdd', '成对分组')
         mixed = self.match('AAccBBDd', '成对分组')
-        self.assertGreater(neat['scores']['视觉一致性'], mixed['scores']['视觉一致性'])
-        self.assertEqual(self.match('aaccbbdd', '成对分组')['scores']['结构规整'], mixed['scores']['结构规整'])
+        self.assertEqual(neat['score'], mixed['score'])
         alternating = self.match('AaAaAaAaAa', '同字母混合大小写')
         messy = self.match('aAaAAAaaAa', '同字母混合大小写')
-        self.assertGreater(alternating['scores']['视觉一致性'], messy['scores']['视觉一致性'])
-        self.assertGreater(self.match('aaaaaaaaaa', '纯豹子')['scores']['有意义长度'],
-                           self.match('aaaaaaaa', '纯豹子')['scores']['有意义长度'])
+        self.assertEqual(alternating['score'], messy['score'])
+        self.assertGreater(self.match('aaaaaaaaaa', '纯豹子', 12)['score'],
+                           self.match('aaaaaaaa', '纯豹子', 26)['score'])
         full = ranker.score_match(next(m for m in ranker.find_matches(embed('ABCABCABCABC'))
                                       if m['series'] == '含字母周期重复' and m['content'] == 'ABCABCABCABC'), self.config)
         partial = ranker.score_match(next(m for m in ranker.find_matches(embed('ABCABCABCAB'))
                                          if m['series'] == '含字母周期重复' and m['content'] == 'ABCABCABCAB'), self.config)
-        self.assertGreater(full['scores']['结构规整'], partial['scores']['结构规整'])
+        self.assertGreater(full['score'], partial['score'])
 
     def test_positions_and_same_fragment_scoring(self):
         tail = self.match('aabbccdd', '成对分组', 26)
         front = self.match('aabbccdd', '成对分组', 1)
         middle = self.match('aabbccdd', '成对分组', 6)
-        self.assertEqual([m['scores']['位置'] for m in (tail, front, middle)], [10, 8, 5])
+        self.assertEqual([m['edge_distance'] for m in (tail, front, middle)], [0, 0, 5])
+        self.assertEqual(tail['score'], front['score'])
+        self.assertGreater(front['score'], middle['score'])
+        near_head = self.match('aabbccdd', '成对分组', 2)
+        near_tail = self.match('aabbccdd', '成对分组', 25)
+        self.assertEqual(near_head['score'], near_tail['score'])
+        self.assertGreater(front['score'], near_head['score'])
+        self.assertGreater(near_head['score'], middle['score'])
         address = embed('aabbccdd', 1)
         address = address[:26]+'AAbbCCdd'
         ranked = ranker.rank_address(address, self.config)
@@ -117,10 +121,9 @@ class RankerTests(unittest.TestCase):
     def test_config_preferences_and_validation(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder)/'config.json'
-            path.write_text(json.dumps({'偏好字符': 'aAbB', '偏好系列': ['成对分组']}), encoding='utf-8')
+            path.write_text(json.dumps(self.config), encoding='utf-8')
             config = ranker.load_config(path)
-            match = next(m for m in ranker.rank_address(embed('aabbaabb'), config)['series_matches'] if m['series'] == '成对分组')
-            self.assertEqual(match['scores']['个人偏好'], 5)
+            self.assertEqual(config, self.config)
             for invalid in ({'权重': {'有意义长度': 99}}, {'位置系数': {'尾部': 2}}, {'偏好字符': '0'},
                             {'偏好系列': ['不存在']}, {'未知参数': 1}):
                 path.write_text(json.dumps(invalid), encoding='utf-8')
@@ -176,7 +179,7 @@ class RankerTests(unittest.TestCase):
                              (3, 1, 2, 1))
             self.assertEqual(len(read_csv(output/'总排行榜.csv')), 1)
             self.assertEqual(len(read_csv(output/'未匹配.csv')), 1)
-            records = [json.loads(line) for line in (output/'完整评分结果.jsonl').read_text(encoding='utf-8').splitlines()]
+            records = [json.loads(line) for line in (output/'详细数据'/'完整评分结果.jsonl').read_text(encoding='utf-8').splitlines()]
             self.assertEqual(len(records), 3)
             record = next(r for r in records if r['address'] == addresses[0])
             self.assertIsNone(record['private_key'])
@@ -184,17 +187,17 @@ class RankerTests(unittest.TestCase):
             self.assertEqual(len(record['conflicting_private_keys']), 2)
             self.assertEqual(record['sources'][0]['metadata']['time'], 'original-time')
             self.assertEqual(record['sources'][0]['metadata']['matches'], [{'old': True}])
-            self.assertNotIn('私钥', read_csv(output/'成对分组.csv')[0])
+            self.assertEqual(list(read_csv(output/'分类'/'成对分组.csv')[0]), ['地址', '位数'])
             for series in ranker.SERIES:
-                data = read_csv(output/(series+'.csv'))
+                data = read_csv(output/'分类'/(series+'.csv'))
                 self.assertEqual(len({r['地址'] for r in data}), len(data))
-                self.assertEqual([float(r['总分']) for r in data], sorted([float(r['总分']) for r in data], reverse=True))
+                self.assertEqual([int(r['位数']) for r in data], sorted([int(r['位数']) for r in data], reverse=True))
             with self.assertRaises(ValueError):
                 ranker.run_ranking([source], output, self.config)
             with contextlib.redirect_stdout(io.StringIO()):
-                ranker.run_ranking([source], Path(folder)/'filtered', self.config, min_score=100, include_keys=True)
+                ranker.run_ranking([source], Path(folder)/'filtered', self.config, min_score=100)
             self.assertEqual(read_csv(Path(folder)/'filtered'/'总排行榜.csv'), [])
-            self.assertEqual(len((Path(folder)/'filtered'/'完整评分结果.jsonl').read_text(encoding='utf-8').splitlines()), 3)
+            self.assertEqual(len((Path(folder)/'filtered'/'详细数据'/'完整评分结果.jsonl').read_text(encoding='utf-8').splitlines()), 3)
 
     def test_cli_standalone_and_series_sorting(self):
         addresses = [checked_address(s) for s in ('AAccBBDd', 'aabbccdd', 'aabbccddeeff', 'aaccbbdd')]
@@ -204,13 +207,40 @@ class RankerTests(unittest.TestCase):
             process = subprocess.run([sys.executable, '-S', str(Path(ranker.__file__)), str(source), '-o', str(output)],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
             self.assertEqual(process.returncode, 0, process.stderr.decode('utf-8', errors='replace'))
-            data = read_csv(output/'成对分组.csv')
+            data = read_csv(output/'分类'/'成对分组.csv')
             self.assertEqual(len(data), len(addresses))
-            self.assertEqual(data[0]['匹配内容'], 'aabbccddeeff')
-            self.assertEqual([float(r['总分']) for r in data], sorted([float(r['总分']) for r in data], reverse=True))
-            self.assertEqual([int(r['排名']) for r in data], [1, 2, 3, 4])
+            # The following RR is also part of the longest valid grouping.
+            self.assertEqual(data[0], {'地址': addresses[2], '位数': '14'})
+            self.assertEqual([int(r['位数']) for r in data], sorted([int(r['位数']) for r in data], reverse=True))
+            txt_rows = (output/'分类'/'成对分组.txt').read_text(encoding='utf-8-sig').splitlines()[1:]
+            self.assertEqual([row.split() for row in txt_rows], [[r['地址'], r['位数']] for r in data])
             self.assertEqual(len(read_csv(output/'总排行榜.csv')), 4)
             self.assertTrue((output/'总排行榜.csv').read_bytes().startswith(b'\xef\xbb\xbf'))
+
+    def test_length_and_edge_priority_for_all_windows(self):
+        by_length = {}
+        for length in range(2, 35):
+            matches = [ranker.score_match(dict(series='纯豹子', content='A'*length,
+                       length=length, start=start, group_lengths=[length], tags=[]), self.config)
+                       for start in range(35-length)]
+            by_length[length] = matches
+            for a in matches:
+                for b in matches:
+                    if a['edge_distance'] < b['edge_distance']:
+                        self.assertGreater(a['score'], b['score'])
+            if length > 2:
+                self.assertGreater(min(m['score'] for m in matches), max(m['score'] for m in by_length[length-1]))
+
+    def test_export_equal_lengths_sorted_by_edge_distance(self):
+        addresses = [checked_address('aabbccdd', start) for start in (12, 4, 20)]
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = Path(folder)/'input.txt', Path(folder)/'out'
+            source.write_text('\n'.join(addresses), encoding='utf-8')
+            with contextlib.redirect_stdout(io.StringIO()):
+                ranker.run_ranking([source], output, self.config, minimum=8, maximum=8)
+            rows = read_csv(output/'分类'/'成对分组.csv')
+            self.assertEqual([r['地址'] for r in rows], [addresses[1], addresses[2], addresses[0]])
+            self.assertTrue(all(set(r) == {'地址', '位数'} for r in rows))
 
     def test_unrecognized_input_is_reported(self):
         with tempfile.TemporaryDirectory() as folder:

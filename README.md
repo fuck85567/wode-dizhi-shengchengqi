@@ -8,7 +8,7 @@
 > 操作、规则、输出格式和验证状态以 [全地址宽筛说明](docs/全地址宽筛说明.md) 为准；下方保留上游原版说明。
 > 当前开发机器无 NVIDIA CUDA 显卡，尚未完成真机性能验收。
 
-离线精品筛选器：运行 `python vanity_ranker.py "命中地址"`，按有意义长度、视觉一致性、结构规整、位置、个人偏好评分，导出总榜和各系列 CSV。该程序只需 Python，不需要显卡或第三方库；Windows 可双击 `靓号筛选器.bat`。详见 [使用说明](docs/离线精品筛选器.md)。
+离线精品筛选器：运行 `python vanity_ranker.py "命中地址"`，长度优先，同长度越靠近首尾越靠前。打开输出的 `总排行榜.txt` 即可查看，只有地址、位数两列；各系列榜在 `分类` 文件夹。该程序只需 Python，不需要显卡或第三方库；Windows 可双击 `靓号筛选器.bat`。详见 [使用说明](docs/离线精品筛选器.md)。
 
 <p align="left">
   <img alt="中文 当前" src="https://img.shields.io/badge/%E4%B8%AD%E6%96%87-%E5%BD%93%E5%89%8D-0969da?style=flat-square">
